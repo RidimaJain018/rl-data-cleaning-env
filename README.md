@@ -2,7 +2,7 @@
 title: RL Data Cleaning Agent
 emoji: 🧹
 colorFrom: purple
-colorTo: teal
+colorTo: green
 sdk: docker
 app_port: 8000
 pinned: false
