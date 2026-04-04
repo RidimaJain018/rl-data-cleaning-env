@@ -21,7 +21,7 @@ from typing import Literal, Optional
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -73,6 +73,8 @@ def _require_env(sid: str) -> DataCleaningEnv:
 class ResetRequest(BaseModel):
     task_level: str = "medium"
 
+    model_config = {"extra": "allow"}
+
 class RunRequest(BaseModel):
     task_level: Literal["easy", "medium", "hard"] = "medium"
     agent: Literal["baseline"] = "baseline"
@@ -117,10 +119,27 @@ def health():
 
 
 @app.post("/reset")
-def reset(body: ResetRequest, x_session_id: Optional[str] = Header(default=None)) -> dict:
+async def reset(request: Request, x_session_id: Optional[str] = Header(default=None)) -> dict:
+    """
+    Start a new episode. Accepts an optional JSON body with task_level.
+    Works with empty body, null body, or {"task_level": "easy"|"medium"|"hard"}.
+    """
     sid = x_session_id or DEFAULT_SESSION
     env = _get_env(sid)
-    obs = _obs_to_model(env.reset(task_level=body.task_level))
+
+    # Safely parse body — handle empty, null, or missing body gracefully
+    task_level = "medium"
+    try:
+        body_bytes = await request.body()
+        if body_bytes and body_bytes.strip() and body_bytes.strip() != b"null":
+            import json
+            body_json = json.loads(body_bytes)
+            if isinstance(body_json, dict):
+                task_level = body_json.get("task_level", "medium") or "medium"
+    except Exception:
+        pass  # Fall back to default task_level
+
+    obs = _obs_to_model(env.reset(task_level=task_level))
     return {"observation": obs.model_dump() if obs else None}
 
 
