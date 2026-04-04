@@ -1,0 +1,354 @@
+# OpenEnv Environment Specification
+# ===================================
+# RL Data Cleaning Agent — v1.2.0
+# Ten-column employee dataset across three difficulty levels.
+# 7 issue types: missing · outlier · invalid_rating · invalid_negative
+#                duplicate · type_mismatch · whitespace_padding
+
+name: rl-data-cleaning-env
+description: >
+  A reinforcement-learning environment for tabular data cleaning.
+  The agent inspects one problematic data row per step and chooses an action
+  (skip / impute_missing / fix_outlier) to iteratively clean a dirty DataFrame.
+  Three difficulty levels expose progressively harder data quality challenges:
+  missing values, salary/bonus outliers, invalid negatives, invalid rating scores,
+  duplicate rows, type mismatches, and whitespace padding — across a 10-column
+  employee dataset (age, salary, city, experience, rating, department, bonus,
+  years_at_company, performance_score, overtime_hours).
+version: "1.2.0"
+tags:
+  - data-cleaning
+  - tabular
+  - openenv-hackathon
+  - reinforcement-learning
+
+# ---------------------------------------------------------------------------
+# Server configuration
+# ---------------------------------------------------------------------------
+server:
+  module: app
+  app: app
+  host: "0.0.0.0"
+  port: 8000
+
+# ---------------------------------------------------------------------------
+# Required environment variables (hackathon spec)
+# ---------------------------------------------------------------------------
+env_variables:
+  API_BASE_URL:
+    description: Base URL for the OpenAI-compatible LLM API endpoint.
+    example: "https://api-inference.huggingface.co/v1"
+    required: true
+  MODEL_NAME:
+    description: Model identifier passed to the LLM API.
+    example: "meta-llama/Llama-3.2-3B-Instruct"
+    required: true
+  HF_TOKEN:
+    description: Hugging Face API token used as the API key.
+    example: "hf_..."
+    required: true
+  AGENT_TYPE:
+    description: Agent to run in inference.py — "baseline" or "llm".
+    default: "baseline"
+    required: false
+
+# ---------------------------------------------------------------------------
+# Endpoints (OpenEnv 3-method interface: reset / step / state)
+# ---------------------------------------------------------------------------
+endpoints:
+  reset:
+    method: POST
+    path: /reset
+    description: >
+      Start a new episode for the given task level.
+      Returns the first observation (row with data issues) or null if clean.
+    request:
+      content_type: application/json
+      schema:
+        type: object
+        properties:
+          task_level:
+            type: string
+            enum: [easy, medium, hard]
+            default: medium
+        required: []
+    response:
+      content_type: application/json
+      schema:
+        type: object
+        properties:
+          observation:
+            oneOf:
+              - $ref: "#/models/ObservationModel"
+              - type: "null"
+
+  step:
+    method: POST
+    path: /step
+    description: >
+      Apply one action to the current issue row.
+      Returns the next observation, reward signal, done flag, and step count.
+    request:
+      content_type: application/json
+      schema:
+        $ref: "#/models/ActionModel"
+    response:
+      content_type: application/json
+      schema:
+        $ref: "#/models/StepResultModel"
+
+  state:
+    method: GET
+    path: /state
+    description: >
+      Return a full snapshot of the current episode state without advancing it.
+      Includes task level, step counts, score, remaining issues, and episode log.
+    response:
+      content_type: application/json
+      schema:
+        $ref: "#/models/EnvStateModel"
+
+  run:
+    method: POST
+    path: /run
+    description: >
+      Run a complete episode from start to finish using the baseline agent
+      and return the final EnvStateModel. Useful for smoke tests and automated
+      evaluation pipelines (no step-by-step loop needed).
+    request:
+      content_type: application/json
+      schema:
+        type: object
+        properties:
+          task_level:
+            type: string
+            enum: [easy, medium, hard]
+            default: medium
+          agent:
+            type: string
+            enum: [baseline]
+            default: baseline
+    response:
+      content_type: application/json
+      schema:
+        $ref: "#/models/EnvStateModel"
+
+  upload:
+    method: POST
+    path: /upload
+    description: >
+      Upload any CSV file to start a cleaning episode.
+      Auto-detects numeric vs categorical columns and applies IQR-based outlier
+      detection — works with any column names and row counts.
+    request:
+      content_type: multipart/form-data
+      body:
+        file: CSV file (binary upload)
+    response:
+      content_type: application/json
+      schema:
+        type: object
+        properties:
+          observation:
+            oneOf:
+              - $ref: "#/models/ObservationModel"
+              - type: "null"
+          total_issues:
+            type: integer
+          rows:
+            type: integer
+          columns:
+            type: array
+            items:
+              type: string
+
+  health:
+    method: GET
+    path: /health
+    description: 'Liveness probe — returns {"status": "ok"}.'
+    response:
+      content_type: application/json
+
+# ---------------------------------------------------------------------------
+# Pydantic model references
+# ---------------------------------------------------------------------------
+models:
+  module: models
+  ObservationModel:     ObservationModel
+  ActionModel:          ActionModel
+  RewardModel:          RewardModel
+  StepResultModel:      StepResultModel
+  EpisodeLogEntryModel: EpisodeLogEntryModel
+  EnvStateModel:        EnvStateModel
+
+# ---------------------------------------------------------------------------
+# Action space
+# ---------------------------------------------------------------------------
+action_space:
+  type: discrete
+  n: 3
+  note: >
+    Action IDs are 0, 1, and 3. ID 2 is intentionally reserved for a future
+    flag_for_review action and is not valid in this version.
+  actions:
+    - id: 0
+      label: skip
+      description: >
+        Do nothing; move to the next issue without modifying the data.
+        Correct when the row has no detectable issue.
+    - id: 1
+      label: impute_missing
+      description: >
+        Fill a NaN / missing (null) cell with the column mean (numeric columns)
+        or the column mode (categorical columns).
+        Correct for issue type: missing.
+    - id: 3
+      label: fix_outlier
+      description: >
+        Replace an invalid, corrupt, or out-of-range value with the column mean.
+        Also handles: duplicate rows (drops the row), type mismatches (coerces
+        to numeric then imputes), and whitespace padding (strips the string).
+        Correct for issue types: outlier, invalid_negative, invalid_rating,
+        duplicate, type_mismatch, whitespace_padding.
+
+# ---------------------------------------------------------------------------
+# Observation space  (10-column employee dataset)
+# ---------------------------------------------------------------------------
+observation_space:
+  type: dict
+  description: >
+    A single row from the dirty 10-column employee DataFrame, presented as
+    key-value pairs. Missing cells appear as null. Outlier / invalid cells
+    retain their raw values. A type_mismatch row may contain a non-parseable
+    string (e.g. "N/A", "ten") in a numeric column. A whitespace_padding row
+    may contain a string with leading/trailing spaces.
+  fields:
+    age:
+      type: "number | string | null"
+      nullable: true
+      description: "Age in years (22–62). Issues: null (missing), negative (invalid_negative), non-parseable string e.g. 'N/A' (type_mismatch)."
+    salary:
+      type: "number | null"
+      nullable: false
+      description: "Annual salary in USD (35k–180k). Issues: > 300,000 (outlier)."
+    city:
+      type: "string | null"
+      nullable: true
+      description: "City name (one of 8 US cities). Issues: null (missing), leading/trailing spaces e.g. ' NY ' (whitespace_padding)."
+    experience:
+      type: "number | null"
+      nullable: true
+      description: "Years of professional experience (0–30). Issues: null (missing), negative (invalid_negative)."
+    rating:
+      type: "number | null"
+      nullable: true
+      description: "Performance rating 0–5 (valid range 2.5–4.9). Issues: null (missing), > 5 (invalid_rating)."
+    department:
+      type: "string | null"
+      nullable: true
+      description: "Department name (one of 6 departments). Issues: null (missing), leading/trailing spaces (whitespace_padding)."
+    bonus:
+      type: "number | null"
+      nullable: true
+      description: "Annual bonus in USD (0–25k). Issues: null (missing), > 80,000 (outlier)."
+    years_at_company:
+      type: "number | string | null"
+      nullable: true
+      description: "Years at current employer (0–20). Issues: null (missing), negative (invalid_negative), non-parseable string e.g. 'ten' (type_mismatch)."
+    performance_score:
+      type: "number | null"
+      nullable: true
+      description: "Performance score 0–5 (valid range 2.5–4.9). Issues: null (missing), > 5 (invalid_rating)."
+    overtime_hours:
+      type: "number | null"
+      nullable: true
+      description: "Monthly overtime hours (0–80). Issues: null (missing), negative (invalid_negative)."
+
+# ---------------------------------------------------------------------------
+# Issue types (all possible values of EpisodeLogEntryModel.issue)
+# ---------------------------------------------------------------------------
+issue_types:
+  - id: missing
+    description: "A cell contains NaN or null. Correct action: 1 (impute_missing)."
+  - id: outlier
+    description: "salary > 300,000 or bonus > 80,000. Correct action: 3 (fix_outlier)."
+  - id: invalid_rating
+    description: "rating or performance_score > 5. Correct action: 3 (fix_outlier)."
+  - id: invalid_negative
+    description: "A numeric column contains a negative value (overtime_hours, years_at_company, experience, age). Correct action: 3 (fix_outlier)."
+  - id: duplicate
+    description: "An exact duplicate of a previously seen row. Correct action: 3 (fix_outlier — drops the row)."
+  - id: type_mismatch
+    description: "A non-parseable string (e.g. 'N/A', 'ten') in an expected-numeric column (age, years_at_company). Correct action: 3 (fix_outlier — coerces and imputes)."
+  - id: whitespace_padding
+    description: "A string column value has leading or trailing whitespace (city, department). Correct action: 3 (fix_outlier — strips the string)."
+
+# ---------------------------------------------------------------------------
+# Task descriptions  (row/issue counts match env.py load_task_data exactly)
+# ---------------------------------------------------------------------------
+tasks:
+  easy:
+    rows: 20
+    issues: 8
+    issue_types_present: [missing]
+    description: >
+      20-row dataset with exactly 8 missing (NaN) cells spread across 8 different
+      columns: age, city, experience, rating, department, bonus, years_at_company,
+      performance_score. Every correct action is impute_missing (1).
+      Seed: 42.
+
+  medium:
+    rows: 30
+    issues: 12
+    issue_types_present: [missing, outlier, invalid_rating, invalid_negative, whitespace_padding]
+    description: >
+      30-row dataset with 12 issues:
+        5 missing values (age, city, experience, department, overtime_hours),
+        3 outliers (2 salary outliers 320k–2M, 1 bonus outlier 90k–250k),
+        2 invalid rating scores (performance_score and rating both > 5),
+        1 invalid negative (overtime_hours < 0),
+        1 whitespace-padded city string.
+      Agent must distinguish impute_missing (action 1) from fix_outlier (action 3).
+      Seed: 123.
+
+  hard:
+    rows: 50
+    issues: 20
+    issue_types_present:
+      - missing
+      - outlier
+      - invalid_negative
+      - duplicate
+      - type_mismatch
+      - whitespace_padding
+      - invalid_rating
+    description: >
+      50-row dataset with 20 issues covering all 7 issue types:
+        6 missing values (age, city, experience, rating, department, performance_score),
+        4 outliers (3 salary outliers 400k–4M, 1 bonus outlier 100k–350k),
+        2 invalid negatives (overtime_hours < 0, years_at_company < 0),
+        2 duplicate rows (exact copies of two salary-outlier rows),
+        2 type mismatches (age='N/A', years_at_company='ten'),
+        2 whitespace-padded strings (city, department),
+        2 invalid rating scores (performance_score and rating both > 5).
+      Seed: 999.
+
+# ---------------------------------------------------------------------------
+# Reward structure
+# ---------------------------------------------------------------------------
+reward:
+  correct_fix:              +2
+  wrong_action:             -1
+  episode_completion_bonus: +5
+  timeout_penalty:          -5
+  max_steps:                100
+  score_formula:            "fixed_issues / total_issues_at_start  →  float in [0.0, 1.0]"
+
+# ---------------------------------------------------------------------------
+# Baseline scores (deterministic — seeded datasets, rule-based agent)
+# Verified: python inference.py --agent baseline
+# ---------------------------------------------------------------------------
+baseline_scores:
+  easy:   { score: 1.000, total_reward: 21, steps: 8,  fixed: "8/8"   }
+  medium: { score: 1.000, total_reward: 29, steps: 12, fixed: "12/12" }
+  hard:   { score: 1.000, total_reward: 45, steps: 20, fixed: "20/20" }
