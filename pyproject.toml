@@ -1,0 +1,31 @@
+[project]
+name = "rl-data-cleaning-env"
+version = "1.2.0"
+description = "RL environment for tabular data cleaning — Meta x Scaler OpenEnv Hackathon"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+dependencies = [
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "pydantic>=2.0",
+    "python-multipart>=0.0.9",
+    "httpx>=0.27",
+    "gradio>=4.0",
+    "openai>=1.0",
+]
+
+[project.optional-dependencies]
+dev = []
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[tool.openenv]
+name = "rl-data-cleaning-env"
+version = "1.2.0"
+spec = "openenv.yaml"
