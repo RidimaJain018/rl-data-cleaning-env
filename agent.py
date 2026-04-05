@@ -18,11 +18,7 @@ def baseline_agent(observation) -> int:
 
     row = observation["row_data"]
 
-    # 1 — duplicate row hint (env injects _issue into every observation)
-    if observation.get("_issue") == "duplicate":
-        return 3
-
-    # 2 — type mismatch: non-parseable string in an expected-numeric column
+    # 1 — type mismatch: non-parseable string in an expected-numeric column
     for key, val in row.items():
         if key in EXPECTED_NUMERIC and isinstance(val, str):
             try:
@@ -118,10 +114,5 @@ def upload_agent(observation) -> int:
             if val < 0:
                 return 3
 
-    # 5 — if env flagged this row but we can't tell why from raw values,
-    #     it's almost certainly an IQR outlier → fix it
-    if observation.get("_issue") is not None:
-        return 3
-
-    # 6 — no detectable issue
+    # 5 — no detectable issue
     return 0

@@ -64,46 +64,50 @@ def _llm_factory(api_key: str, base_url: str, model: str):
     import json
     import re
     from openai import OpenAI
-    from env import EXPECTED_NUMERIC, OUTLIER_THRESHOLDS, SCORE_COLS
     client = OpenAI(api_key=api_key.strip(), base_url=base_url.strip() or None)
 
     def _agent(obs):
         if obs is None:
             return 0
         row = obs["row_data"]
-        lines, hints = [], []
+        # Show raw values only — no pre-computed hints so the LLM must reason genuinely
+        lines = []
         for col, val in row.items():
             if val is None or (isinstance(val, float) and str(val) == "nan"):
-                lines.append(f"  {col}: MISSING")
-                hints.append(f"{col} is missing")
+                lines.append(f"  {col}: NULL")
+            elif isinstance(val, str):
+                lines.append(f'  {col}: "{val}"')
             else:
                 lines.append(f"  {col}: {val}")
-                if col in EXPECTED_NUMERIC and isinstance(val, str):
-                    try:
-                        float(val)
-                    except (ValueError, TypeError):
-                        hints.append(f"{col}='{val}' type mismatch")
-                elif isinstance(val, str) and val != val.strip():
-                    hints.append(f"{col} has whitespace padding")
-                elif col in OUTLIER_THRESHOLDS and isinstance(val, (int, float)) \
-                        and val > OUTLIER_THRESHOLDS[col]:
-                    hints.append(f"{col}={val} outlier")
-                elif col in SCORE_COLS and isinstance(val, (int, float)) and val > 5:
-                    hints.append(f"{col}={val} invalid (>5)")
-                elif isinstance(val, (int, float)) and val < 0:
-                    hints.append(f"{col}={val} negative")
         try:
             resp = client.chat.completions.create(
                 model=model.strip() or "meta-llama/Llama-3.2-3B-Instruct",
                 messages=[
                     {"role": "system", "content":
-                     "You are a data-cleaning agent. Pick one action:\n"
-                     "0=skip  1=impute_missing  3=fix_outlier\n"
+                     "You are an expert data quality analyst reviewing rows from an employee dataset.\n\n"
+                     "DATASET SCHEMA AND VALID RANGES:\n"
+                     "  age              : integer, valid range 22-62\n"
+                     "  salary           : integer USD, valid range 35000-180000\n"
+                     "  city             : string, one of [NY, LA, SF, Chicago, Austin, Seattle, Boston, Denver]\n"
+                     "  experience       : integer years, valid range 0-30\n"
+                     "  rating           : float, valid range 0.0-5.0\n"
+                     "  department       : string, one of [Engineering, Sales, HR, Marketing, Finance, Operations]\n"
+                     "  bonus            : integer USD, valid range 0-25000\n"
+                     "  years_at_company : integer years, valid range 0-20\n"
+                     "  performance_score: float, valid range 0.0-5.0\n"
+                     "  overtime_hours   : integer, valid range 0-80\n\n"
+                     "ACTIONS:\n"
+                     "  0 = skip           — row has no data quality issue\n"
+                     "  1 = impute_missing — row has a NULL / missing cell\n"
+                     "  3 = fix_outlier    — row has any other issue (outlier, invalid value,\n"
+                     "                       type mismatch, whitespace padding, negative)\n\n"
+                     "Carefully examine each field against the valid ranges. "
                      'Reply ONLY with JSON: {"action": <0|1|3>}'},
                     {"role": "user", "content":
-                     "Row:\n" + "\n".join(lines) +
-                     f"\nIssue hint: {'; '.join(hints) or 'none'}\n"
-                     'Reply ONLY with JSON.'},
+                     "Examine this employee record and identify any data quality issue:\n\n"
+                     + "\n".join(lines)
+                     + "\n\nCheck each field against the valid ranges. "
+                     'Reply ONLY with JSON: {"action": <0|1|3>}'},
                 ],
                 temperature=0, max_tokens=32,
             )

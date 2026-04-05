@@ -155,6 +155,7 @@ class DataCleaningEnv:
         self.current_idx            = 0
         self.steps                  = 0
         self.total_issues_at_start  = len(self.issues)
+        self.max_steps              = max(20, 3 * self.total_issues_at_start)
         return self.get_observation()
 
     # -----------------------------------------------------------------------
@@ -187,6 +188,7 @@ class DataCleaningEnv:
         self.current_idx           = 0
         self.steps                 = 0
         self.total_issues_at_start = len(self.issues)
+        self.max_steps             = max(20, 3 * self.total_issues_at_start)
         return self.get_observation()
 
     # -----------------------------------------------------------------------
@@ -377,8 +379,7 @@ class DataCleaningEnv:
         if row_idx not in self.df.index:          # guard after duplicate drop
             self.current_idx = 0
             row_idx, _, _ = self.issues[0]
-        _, _, issue_type = self.issues[self.current_idx]
-        return {"row_data": self.df.loc[row_idx].to_dict(), "_issue": issue_type}
+        return {"row_data": self.df.loc[row_idx].to_dict()}
 
     # -----------------------------------------------------------------------
     # STEP
