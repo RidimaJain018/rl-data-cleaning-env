@@ -26,7 +26,7 @@ dev = [
 ]
 
 [project.scripts]
-server    = "app:app"
+server    = "app:main"
 inference = "inference:__main__"
 
 [build-system]
