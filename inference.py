@@ -42,6 +42,17 @@ from agent import baseline_agent
 from env import DataCleaningEnv
 from models import VALID_ACTIONS
 
+# ---------------------------------------------------------------------------
+# Required environment variables (hackathon spec)
+# HF_TOKEN has NO default — must be set by the user
+# ---------------------------------------------------------------------------
+API_BASE_URL = os.getenv("API_BASE_URL", "https://api-inference.huggingface.co/v1")
+MODEL_NAME   = os.getenv("MODEL_NAME", "meta-llama/Llama-3.2-3B-Instruct")
+HF_TOKEN     = os.getenv("HF_TOKEN")
+
+# Optional — used if deploying via from_docker_image()
+LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
+
 # ── Colours (disabled when not a TTY) ────────────────────────────────────────
 _IS_TTY = os.isatty(1)
 def _c(code: str, text: str) -> str:
@@ -80,13 +91,9 @@ def llm_agent(observation: dict | None) -> int:
         print("[llm_agent] openai package not installed. Falling back to baseline.")
         return baseline_agent(observation)
 
-    api_key  = os.environ.get("HF_TOKEN") or os.environ.get("OPENAI_API_KEY", "")
-    base_url = os.environ.get("API_BASE_URL") or os.environ.get("OPENAI_BASE_URL", None)
-    model    = (
-        os.environ.get("MODEL_NAME")
-        or os.environ.get("OPENAI_MODEL")
-        or "meta-llama/Llama-3.2-3B-Instruct"
-    )
+    api_key  = HF_TOKEN or os.environ.get("OPENAI_API_KEY", "")
+    base_url = API_BASE_URL
+    model    = MODEL_NAME
 
     if not api_key:
         print("[llm_agent] No API key found. Falling back to baseline.")
@@ -364,10 +371,7 @@ def print_episode_summary(results: list[dict], agent_name: str) -> None:
 # LLM availability check
 # ---------------------------------------------------------------------------
 def _llm_vars_set() -> bool:
-    return bool(
-        (os.environ.get("HF_TOKEN") or os.environ.get("OPENAI_API_KEY"))
-        and (os.environ.get("API_BASE_URL") or os.environ.get("OPENAI_BASE_URL"))
-    )
+    return bool(HF_TOKEN and API_BASE_URL)
 
 
 # ---------------------------------------------------------------------------
@@ -426,7 +430,7 @@ if __name__ == "__main__":
     # ── Run LLM agent ─────────────────────────────────────────────────────
     llm_results = None
     if run_llm:
-        model = os.environ.get("MODEL_NAME") or os.environ.get("OPENAI_MODEL", "unknown")
+        model = MODEL_NAME
         print(f"\n{BOLD('Running LLM agent')} {DIM('(model: ' + model + ')')}")
         llm_results = []
         for lvl in levels:
