@@ -305,8 +305,15 @@ async def health():
 
 
 # ---------------------------------------------------------------------------
+# main() — entry point referenced by openenv.yaml (server.app = main)
+# ---------------------------------------------------------------------------
+def main():
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=False)
+
+
+# ---------------------------------------------------------------------------
 # Entry point (used by start.sh via uvicorn app:app)
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=False)
+    main()
