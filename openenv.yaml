@@ -344,6 +344,40 @@ reward:
   max_steps:                100
   score_formula:            "fixed_issues / total_issues_at_start  →  float in [0.0, 1.0]"
 
+  design_rationale: >
+    The reward structure is designed to produce dense, meaningful learning signals
+    at every step — not just terminal rewards.
+
+    correct_fix (+2): A per-step positive reward for every successful fix ensures
+    the agent gets immediate feedback proportional to its progress. This avoids
+    the sparse-reward problem common in binary pass/fail environments.
+
+    wrong_action (-1): A small penalty for incorrect actions (e.g. applying
+    impute_missing to an outlier row) discourages random action selection without
+    making early mistakes catastrophic. The asymmetry (+2 vs -1) means the agent
+    is rewarded more for being right than it is punished for being wrong, which
+    encourages exploration during training.
+
+    episode_completion_bonus (+5): A terminal bonus for resolving all issues
+    rewards the agent for thoroughness — an agent that fixes 19/20 issues scores
+    lower than one that fixes all 20. This creates a clear gradient toward
+    complete dataset cleaning, not just partial improvement.
+
+    timeout_penalty (-5): If the agent exceeds max_steps (100) without cleaning
+    all issues, it receives a penalty. This prevents a degenerate policy of
+    repeatedly cycling through rows without committing to fixes.
+
+    score_formula: The partial-credit score (fixed / total) is reported separately
+    from cumulative reward. This gives a normalised [0.0, 1.0] metric that is
+    comparable across episodes with different numbers of issues, making it
+    suitable for automated grading and cross-level comparison.
+
+  partial_progress_signals:
+    - Per-step reward on every correct fix (not just episode end)
+    - Score updates after each correct action (visible via /state)
+    - Episode log records per-step correctness for fine-grained analysis
+    - Remaining issues count decrements after each correct fix
+
 # ---------------------------------------------------------------------------
 # Baseline scores (deterministic — seeded datasets, rule-based agent)
 # Verified: python inference.py --agent baseline

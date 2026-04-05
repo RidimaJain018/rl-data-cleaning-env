@@ -22,6 +22,13 @@ This project frames **data cleaning as a sequential decision-making problem**: a
 
 The environment is fully compliant with the **OpenEnv 3-method interface** (`reset` / `step` / `state`) and is deployable as a Hugging Face Space with a Docker runtime.
 
+The choices involved in data cleaning — *should I impute this missing value or is this an outlier?* — are **sequential and context-dependent**, making RL a natural fit:
+
+- **State**: the current dirty row being inspected
+- **Action**: skip / impute_missing / fix_outlier
+- **Reward**: +2 per correct fix, −1 for wrong actions, +5 completion bonus
+- **Goal**: clean the entire dataset with maximum accuracy and minimum wasted steps
+
 ---
 
 ## Action Space
@@ -88,6 +95,18 @@ Each observation is a single row from the dirty 10-column employee DataFrame:
 | `type_mismatch` | Non-parseable string in a numeric column (e.g. `"N/A"`, `"ten"`) | `3` (fix_outlier — coerces and imputes) |
 | `whitespace_padding` | Leading/trailing spaces in a string column | `3` (fix_outlier — strips) |
 
+### Dirty → Clean Examples
+
+| Issue Type | Dirty value | Cleaned value | How |
+|---|---|---|---|
+| `missing` | `age: null` | `age: 34.5` | Column mean |
+| `outlier` | `salary: 1,500,000` | `salary: 87,423` | Column mean |
+| `invalid_rating` | `performance_score: 7.4` | `performance_score: 3.6` | Column mean |
+| `invalid_negative` | `overtime_hours: -18` | `overtime_hours: 24.1` | Column mean |
+| `duplicate` | identical copy of row 1 | row dropped | Drop |
+| `type_mismatch` | `age: "N/A"` | `age: 34.5` | Coerce → column mean |
+| `whitespace_padding` | `city: " NY "` | `city: "NY"` | Strip |
+
 ---
 
 ## Task Descriptions
@@ -113,6 +132,16 @@ All 7 issue types across 10 columns: 6 missing, 4 outliers (salary/bonus), 2 inv
 | Episode timeout (`max_steps = 100`) | `−5` |
 
 **Score** (0.0–1.0): `fixed_issues / total_issues_at_start`
+
+### Reward Design Rationale
+
+The reward structure is designed to produce **dense, meaningful learning signals at every step** — not just terminal rewards.
+
+- **+2 per correct fix**: Immediate per-step feedback so the agent learns which actions are right without waiting until episode end. This avoids the sparse-reward problem.
+- **−1 for wrong action**: Small enough not to be catastrophic, large enough to discourage random guessing. The +2/−1 asymmetry rewards correct decisions more than it punishes mistakes, which encourages exploration.
+- **+5 completion bonus**: Rewards thoroughness — an agent that fixes 19/20 issues scores meaningfully lower than one that fixes all 20. Creates a clear gradient toward complete cleaning.
+- **−5 timeout penalty**: Prevents a degenerate policy of cycling through rows indefinitely without committing to fixes.
+- **Partial-credit score**: Reported separately from reward as `fixed/total` — a normalised metric comparable across episodes with different issue counts, suitable for automated grading.
 
 ---
 
@@ -241,7 +270,36 @@ export HF_TOKEN="hf_your_token_here"
 python inference.py --agent llm
 ```
 
+### Both agents — side-by-side comparison
+
+```bash
+python inference.py --agent both
+```
+
+### Verbose mode — step-by-step decision trace
+
+```bash
+python inference.py --verbose
+# Shows each step: column · issue type · action taken · correct? · reward
+```
+
+### Single task level
+
+```bash
+python inference.py --task hard
+```
+
 If the LLM call fails (bad key, network error), the agent automatically falls back to `baseline_agent` — the script never crashes.
+
+### Live Space — quick test
+
+```bash
+curl -X POST https://Ridi2007-rl-data-cleaning-env.hf.space/reset \
+     -H "Content-Type: application/json" \
+     -d '{"task_level": "medium"}'
+
+curl https://Ridi2007-rl-data-cleaning-env.hf.space/health
+```
 
 ---
 

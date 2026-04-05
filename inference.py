@@ -52,6 +52,7 @@ YELLOW = lambda t: _c("33", t)
 CYAN   = lambda t: _c("36", t)
 BOLD   = lambda t: _c("1",  t)
 DIM    = lambda t: _c("2",  t)
+RED    = lambda t: _c("31", t)
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +60,11 @@ DIM    = lambda t: _c("2",  t)
 # ---------------------------------------------------------------------------
 def llm_agent(observation: dict | None) -> int:
     """
-    LLM-powered agent. Reads the three required hackathon env variables:
+    LLM-powered agent. The LLM reasons from raw row values and domain
+    knowledge about valid ranges — no pre-computed issue hints are passed.
+    This ensures the model is doing genuine data quality reasoning.
+
+    Reads the three required hackathon env variables:
         HF_TOKEN      — API key
         API_BASE_URL  — base URL of the OpenAI-compatible endpoint
         MODEL_NAME    — model identifier
@@ -90,36 +95,52 @@ def llm_agent(observation: dict | None) -> int:
     client = OpenAI(api_key=api_key, base_url=base_url)
     row    = observation["row_data"]
 
-    row_lines, hints = [], []
+    # Format row values clearly — show NULL explicitly, preserve raw values
+    # so the LLM reasons from the actual data, not pre-labelled hints.
+    row_lines = []
     for col, val in row.items():
         if val is None or (isinstance(val, float) and str(val) == "nan"):
-            row_lines.append(f"  {col}: MISSING (NaN)")
-            hints.append(f"{col} is missing")
+            row_lines.append(f"  {col}: NULL")
+        elif isinstance(val, str):
+            row_lines.append(f"  {col}: \"{val}\"")
         else:
             row_lines.append(f"  {col}: {val}")
-            if col in {"age", "salary", "experience", "rating"} and isinstance(val, str):
-                hints.append(f"{col}='{val}' type mismatch")
-            elif isinstance(val, str) and val != val.strip():
-                hints.append(f"{col}='{val}' whitespace padding")
-            elif col == "salary" and isinstance(val, (int, float)) and val > 200_000:
-                hints.append(f"salary={val} is an outlier (> 200,000)")
-            elif col == "rating" and isinstance(val, (int, float)) and val > 5:
-                hints.append(f"rating={val} is invalid (> 5)")
-            elif isinstance(val, (int, float)) and val < 0:
-                hints.append(f"{col}={val} is negative (invalid)")
 
     system_prompt = (
-        "You are a data-cleaning agent. Choose exactly one action:\n"
-        "  0 = skip           (row has no issue)\n"
-        "  1 = impute_missing  (row has a missing / NaN value)\n"
-        "  3 = fix_outlier    (row has an outlier, invalid value, type mismatch, "
-        "whitespace padding, or is a duplicate)\n\n"
-        'Reply with ONLY a JSON object: {"action": <0|1|3>}'
+        "You are an expert data quality analyst reviewing rows from an employee dataset.\n\n"
+        "DATASET SCHEMA AND VALID RANGES:\n"
+        "  age              : integer, valid range 22–62\n"
+        "  salary           : integer USD, valid range 35000–180000\n"
+        "  city             : string, one of [NY, LA, SF, Chicago, Austin, Seattle, Boston, Denver]\n"
+        "  experience       : integer years, valid range 0–30\n"
+        "  rating           : float, valid range 0.0–5.0\n"
+        "  department       : string, one of [Engineering, Sales, HR, Marketing, Finance, Operations]\n"
+        "  bonus            : integer USD, valid range 0–25000\n"
+        "  years_at_company : integer years, valid range 0–20\n"
+        "  performance_score: float, valid range 0.0–5.0\n"
+        "  overtime_hours   : integer, valid range 0–80\n\n"
+        "ISSUE TYPES TO DETECT:\n"
+        "  - NULL value: any cell showing NULL or missing\n"
+        "  - Outlier: numeric value far outside the valid range shown above\n"
+        "  - Invalid rating: rating or performance_score above 5.0\n"
+        "  - Invalid negative: negative value in a column that must be ≥ 0\n"
+        "  - Type mismatch: non-numeric string (e.g. 'N/A', 'ten') in a numeric column\n"
+        "  - Whitespace padding: string with leading or trailing spaces (e.g. '\" NY \"')\n\n"
+        "ACTIONS:\n"
+        "  0 = skip           — row has no data quality issue\n"
+        "  1 = impute_missing — row has a NULL / missing cell\n"
+        "  3 = fix_outlier    — row has any other issue (outlier, invalid value,\n"
+        "                       type mismatch, whitespace padding)\n\n"
+        "Carefully examine each field against the valid ranges. "
+        "Respond ONLY with a JSON object containing your chosen action and a brief reason:\n"
+        '{"action": <0|1|3>, "reason": "<one concise sentence explaining what you found>"}'
     )
+
     user_prompt = (
-        "Row data:\n" + "\n".join(row_lines) + "\n\n"
-        f"Issue hint: {'; '.join(hints) or 'no obvious issue'}\n\n"
-        'Reply ONLY with JSON, e.g. {"action": 1}'
+        "Examine this employee record and identify any data quality issue:\n\n"
+        + "\n".join(row_lines)
+        + "\n\nCheck each field against the valid ranges in your instructions. "
+        'Respond ONLY with JSON: {"action": <0|1|3>, "reason": "..."}'
     )
 
     try:
@@ -130,14 +151,21 @@ def llm_agent(observation: dict | None) -> int:
                 {"role": "user",   "content": user_prompt},
             ],
             temperature=0,
-            max_tokens=32,
+            max_tokens=80,
         )
         raw = response.choices[0].message.content.strip()
+
         try:
-            action = int(json.loads(raw)["action"])
+            parsed = json.loads(raw)
+            action = int(parsed["action"])
+            reason = parsed.get("reason", "")
         except (json.JSONDecodeError, KeyError, ValueError):
             m = re.search(r'"action"\s*:\s*(\d)', raw)
             action = int(m.group(1)) if m else 0
+            reason = ""
+
+        if reason:
+            print(f"    {DIM('[LLM]')} {reason}")
 
         return action if action in VALID_ACTIONS else 0
 
@@ -147,7 +175,7 @@ def llm_agent(observation: dict | None) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Episode runner
+# Episode runner — standard (returns summary dict)
 # ---------------------------------------------------------------------------
 def run_episode(task_level: str, agent_fn) -> dict:
     """Run one complete episode; return a results dict."""
@@ -168,6 +196,56 @@ def run_episode(task_level: str, agent_fn) -> dict:
         "steps":        env.steps,
         "fixed":        env.total_issues_at_start - len(env.issues),
         "total_issues": env.total_issues_at_start,
+        "episode_log":  list(env.episode_log),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Episode runner — verbose (prints step-by-step trace during run)
+# ---------------------------------------------------------------------------
+def run_episode_verbose(task_level: str, agent_fn, agent_label: str = "agent") -> dict:
+    """
+    Run one complete episode and print a step-by-step decision trace.
+    Shows what issue was found, what action was taken, and whether it was correct.
+    """
+    env  = DataCleaningEnv()
+    obs  = env.reset(task_level=task_level)
+    done = False
+    total_reward = 0
+
+    print(f"\n  {BOLD('Episode trace')} — {agent_label} / {task_level}")
+    print(f"  {'Step':>4}  {'Col':<22} {'Issue':<22} {'Action':<18} {'✓':>2} {'Reward':>6}")
+    print(f"  {'─'*4}  {'─'*22} {'─'*22} {'─'*18} {'─'*2} {'─'*6}")
+
+    while not done:
+        action = agent_fn(obs)
+        obs, reward, done, _ = env.step(action)
+        total_reward += reward
+
+        if env.episode_log:
+            e = env.episode_log[-1]
+            mark = GREEN("✓") if e["correct"] else RED("✗")
+            reward_str = GREEN(f"{e['reward']:+.0f}") if e["reward"] > 0 else RED(f"{e['reward']:+.0f}")
+            print(
+                f"  {e['step']:>4}  {e['col']:<22} {e['issue']:<22} "
+                f"{e['action']:<18} {mark:>2} {reward_str:>6}"
+            )
+
+    score = env.grade()
+    score_str = GREEN(f"{score:.3f}") if score == 1.0 else YELLOW(f"{score:.3f}")
+    print(f"\n  {'─'*78}")
+    print(f"  Score: {score_str}   Steps: {env.steps}   "
+          f"Fixed: {env.total_issues_at_start - len(env.issues)}/{env.total_issues_at_start}   "
+          f"Total reward: {total_reward}")
+
+    return {
+        "task":         task_level,
+        "score":        round(score, 3),
+        "total_reward": total_reward,
+        "steps":        env.steps,
+        "fixed":        env.total_issues_at_start - len(env.issues),
+        "total_issues": env.total_issues_at_start,
+        "episode_log":  list(env.episode_log),
     }
 
 
@@ -189,7 +267,7 @@ def run_all_tasks(agent_fn, label: str = "") -> list[dict]:
 # ---------------------------------------------------------------------------
 # Printers
 # ---------------------------------------------------------------------------
-SEP = "─" * 48
+SEP = "─" * 52
 
 def print_results(results: list[dict], agent_name: str) -> None:
     print(f"\n{BOLD('=== RESULTS — ' + agent_name.upper() + ' AGENT ===')}\n")
@@ -219,11 +297,11 @@ def print_comparison(baseline: list[dict], llm: list[dict]) -> None:
     ║ Task    │  Baseline                │  LLM                  Δ    ║
     ║         │  Score  Reward  Steps   │  Score  Reward  Steps       ║
     ╠══════════════════════════════════════════════════════════════════╣
-    ║ easy    │   1.00    13.0      4   │   1.00    13.0      4  +0.00║
-    ║ medium  │   1.00    15.0      5   │   1.00    15.0      5  +0.00║
-    ║ hard    │   1.00    27.0     11   │   0.82    19.0      8  -0.18║
+    ║ easy    │   1.00    21.0      8   │   1.00    21.0      8  +0.00║
+    ║ medium  │   1.00    29.0     12   │   1.00    29.0     12  +0.00║
+    ║ hard    │   1.00    45.0     20   │   0.90    37.0     18  -0.10║
     ╠══════════════════════════════════════════════════════════════════╣
-    ║ Average │   1.00                  │   0.94              Δ -0.06 ║
+    ║ Average │   1.00                  │   0.97              Δ -0.03 ║
     ╚══════════════════════════════════════════════════════════════════╝
     """
     W = 68
@@ -246,13 +324,6 @@ def print_comparison(baseline: list[dict], llm: list[dict]) -> None:
         b_score = GREEN(f"{b['score']:.2f}") if b["score"] == 1.0 else YELLOW(f"{b['score']:.2f}")
         l_score = GREEN(f"{l['score']:.2f}") if l["score"] == 1.0 else YELLOW(f"{l['score']:.2f}")
 
-        # raw widths for alignment (strip ANSI for counting)
-        raw_line = (
-            f"║ {b['task']:<7} │  "
-            f"{b['score']:>5.2f} {float(b['total_reward']):>7.1f} {b['steps']:>6}   │  "
-            f"{l['score']:>5.2f} {float(l['total_reward']):>7.1f} {l['steps']:>6}  {delta_str:>7} ║"
-        )
-        # Coloured version
         print(
             f"║ {b['task']:<7} │  "
             f"{b_score} {float(b['total_reward']):>7.1f} {b['steps']:>6}   │  "
@@ -269,6 +340,24 @@ def print_comparison(baseline: list[dict], llm: list[dict]) -> None:
         f"║ {'Average':<7} │  {b_avg_s} {'':>21}  │  {l_avg_s} {'':>21} {td_col(td_str):>7} ║"
     )
     print(f"{'╚' + '═'*W + '╝'}")
+
+
+def print_episode_summary(results: list[dict], agent_name: str) -> None:
+    """Print a per-issue breakdown across all tasks for one agent."""
+    print(f"\n{BOLD('Issue-type accuracy — ' + agent_name.upper())}")
+    from collections import defaultdict
+    issue_stats: dict[str, dict] = defaultdict(lambda: {"correct": 0, "total": 0})
+    for r in results:
+        for e in r.get("episode_log", []):
+            issue_stats[e["issue"]]["total"] += 1
+            if e["correct"]:
+                issue_stats[e["issue"]]["correct"] += 1
+    print(f"  {'Issue type':<24} {'Correct':>7} {'Total':>6} {'Accuracy':>9}")
+    print(f"  {'─'*24} {'─'*7} {'─'*6} {'─'*9}")
+    for issue, s in sorted(issue_stats.items()):
+        acc = s["correct"] / s["total"] if s["total"] > 0 else 0
+        acc_str = GREEN(f"{acc:>9.0%}") if acc == 1.0 else YELLOW(f"{acc:>9.0%}")
+        print(f"  {issue:<24} {s['correct']:>7} {s['total']:>6} {acc_str}")
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +388,10 @@ if __name__ == "__main__":
         "--task", choices=["easy", "medium", "hard", "all"], default="all",
         help="Task difficulty to run (default: all)",
     )
+    parser.add_argument(
+        "--verbose", action="store_true",
+        help="Print step-by-step episode trace for each run.",
+    )
     args = parser.parse_args()
 
     # AGENT_TYPE env var takes precedence over --agent flag
@@ -313,11 +406,22 @@ if __name__ == "__main__":
         or (agent_choice == "auto" and _llm_vars_set())
     )
 
+    runner = run_episode_verbose if args.verbose else run_episode
+
     # ── Run baseline ──────────────────────────────────────────────────────
     baseline_results = None
     if run_baseline or run_llm:   # always need baseline for comparison
         print(f"\n{BOLD('Running baseline agent...')}")
-        baseline_results = [run_episode(lvl, baseline_agent) for lvl in levels]
+        baseline_results = []
+        for lvl in levels:
+            if args.verbose:
+                r = run_episode_verbose(lvl, baseline_agent, "baseline")
+            else:
+                print(f"  {lvl} ...", end="", flush=True)
+                t0 = time.monotonic()
+                r = run_episode(lvl, baseline_agent)
+                print(f"  score={r['score']:.2f}  ({time.monotonic()-t0:.1f}s)")
+            baseline_results.append(r)
 
     # ── Run LLM agent ─────────────────────────────────────────────────────
     llm_results = None
@@ -326,20 +430,28 @@ if __name__ == "__main__":
         print(f"\n{BOLD('Running LLM agent')} {DIM('(model: ' + model + ')')}")
         llm_results = []
         for lvl in levels:
-            print(f"  {lvl} ...", end="", flush=True)
-            t0 = time.monotonic()
-            r  = run_episode(lvl, llm_agent)
-            print(f"  score={r['score']:.2f}  ({time.monotonic()-t0:.1f}s)")
+            if args.verbose:
+                r = run_episode_verbose(lvl, llm_agent, "llm")
+            else:
+                print(f"  {lvl} ...", end="", flush=True)
+                t0 = time.monotonic()
+                r = run_episode(lvl, llm_agent)
+                print(f"  score={r['score']:.2f}  ({time.monotonic()-t0:.1f}s)")
             llm_results.append(r)
 
     # ── Print results ─────────────────────────────────────────────────────
     if llm_results and baseline_results and args.task == "all":
         print_comparison(baseline_results, llm_results)
+        # Per-issue accuracy breakdown for both agents
+        print_episode_summary(baseline_results, "baseline")
+        print_episode_summary(llm_results, "llm")
     elif llm_results:
         print_results(baseline_results, "baseline")
         print_results(llm_results, "llm")
+        print_episode_summary(llm_results, "llm")
     elif baseline_results:
         print_results(baseline_results, "baseline")
+        print_episode_summary(baseline_results, "baseline")
         if not _llm_vars_set():
             print(
                 f"\n{DIM('Tip: set HF_TOKEN + API_BASE_URL + MODEL_NAME to also run the LLM agent.')}"

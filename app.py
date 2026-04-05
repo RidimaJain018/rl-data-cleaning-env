@@ -1,227 +1,312 @@
 """
-app.py — OpenEnv-compliant FastAPI server for DataCleaningEnv v1.2
-==================================================================
-Endpoints
----------
-POST /reset    → {"observation": ObservationModel | null}
-POST /step     → StepResultModel
-GET  /state    → EnvStateModel
-POST /run      → EnvStateModel  (full baseline episode in one call)
-POST /upload   → {"observation": ..., "total_issues": int, "rows": int, "columns": [...]}
-GET  /health   → {"status": "ok"}
+app.py — FastAPI OpenEnv server for DataCleaningEnv
+====================================================
+Endpoints (OpenEnv 3-method interface + extras):
+    POST /reset      Start a new episode
+    POST /step       Take one action
+    GET  /state      Full episode snapshot (no side effects)
+    POST /run        Run a complete episode with the baseline agent
+    POST /upload     Upload any CSV and start a cleaning episode
+    GET  /health     Liveness probe → {"status": "ok"}
 
-Sessions keyed by X-Session-Id header ("default" if absent).
-LRU eviction at MAX_SESSIONS = 100 prevents memory growth in long-running Spaces.
+Session isolation:
+    Each client identifies itself via the X-Session-Id header.
+    Multiple clients can run simultaneous episodes on the same server
+    without interfering — each gets its own DataCleaningEnv instance.
+
+Start locally:
+    uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+
+Or via start.sh (production — runs FastAPI + Gradio together):
+    ./start.sh
 """
+
 from __future__ import annotations
 
 import io
-from collections import OrderedDict
-from typing import Literal, Optional
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from agent import baseline_agent, upload_agent
 from env import DataCleaningEnv
 from models import (
-    ActionModel, EnvStateModel, EpisodeLogEntryModel,
-    ObservationModel, RewardModel, StepResultModel,
+    ActionModel,
+    EnvStateModel,
+    ObservationModel,
+    RewardModel,
+    StepResultModel,
 )
 
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
 app = FastAPI(
-    title="DataCleaningEnv — OpenEnv Server",
-    description="RL environment for tabular data cleaning. "
-                "Implements reset / step / state. Accepts user CSVs via /upload.",
+    title="DataCleaningEnv — OpenEnv API",
+    description=(
+        "Reinforcement-learning environment for tabular data cleaning. "
+        "Implements the OpenEnv 3-method interface: reset / step / state."
+    ),
     version="1.2.0",
 )
-app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
-)
 
 # ---------------------------------------------------------------------------
-# Session store — LRU-bounded OrderedDict
+# Session store — one DataCleaningEnv per X-Session-Id
 # ---------------------------------------------------------------------------
-MAX_SESSIONS = 100
-_sessions: OrderedDict[str, DataCleaningEnv] = OrderedDict()
-DEFAULT_SESSION = "default"
+_sessions: dict[str, DataCleaningEnv] = {}
+
+_DEFAULT_SESSION = "default"
 
 
-def _get_env(sid: str) -> DataCleaningEnv:
-    if sid in _sessions:
-        _sessions.move_to_end(sid)
-        return _sessions[sid]
-    if len(_sessions) >= MAX_SESSIONS:
-        _sessions.popitem(last=False)
-    env = DataCleaningEnv()
-    _sessions[sid] = env
-    return env
+def _get_env(session_id: str) -> DataCleaningEnv:
+    """Return the env for this session, creating it if needed."""
+    if session_id not in _sessions:
+        _sessions[session_id] = DataCleaningEnv()
+    return _sessions[session_id]
 
 
-def _require_env(sid: str) -> DataCleaningEnv:
-    if sid not in _sessions:
-        raise HTTPException(400, "No active session. Call POST /reset or POST /upload first.")
-    _sessions.move_to_end(sid)
-    return _sessions[sid]
+def _session_id(x_session_id: Optional[str]) -> str:
+    return x_session_id or _DEFAULT_SESSION
 
 
 # ---------------------------------------------------------------------------
-# Request models
+# Request bodies
 # ---------------------------------------------------------------------------
 class ResetRequest(BaseModel):
     task_level: str = "medium"
 
-    model_config = {"extra": "allow"}
 
 class RunRequest(BaseModel):
-    task_level: Literal["easy", "medium", "hard"] = "medium"
-    agent: Literal["baseline"] = "baseline"
+    task_level: str = "medium"
+    agent: str = "baseline"
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helper — sanitise observation dict for JSON (NaN → None)
 # ---------------------------------------------------------------------------
-def _obs_to_model(raw: Optional[dict]) -> Optional[ObservationModel]:
-    if raw is None:
+def _sanitise_obs(obs: dict | None) -> dict | None:
+    """Replace float NaN with None so Pydantic / JSON serialisation works."""
+    if obs is None:
         return None
-    cleaned = {}
-    for k, v in raw["row_data"].items():
-        if isinstance(v, float) and np.isnan(v):       cleaned[k] = None
-        elif isinstance(v, np.integer):                 cleaned[k] = int(v)
-        elif isinstance(v, np.floating):                cleaned[k] = float(v)
-        else:                                           cleaned[k] = v
-    return ObservationModel(row_data=cleaned)
+    clean = {
+        k: (None if (isinstance(v, float) and np.isnan(v)) else v)
+        for k, v in obs["row_data"].items()
+    }
+    return {"row_data": clean}
 
 
-def _build_state(env: DataCleaningEnv, done: bool = False) -> EnvStateModel:
-    total = getattr(env, "total_issues_at_start", 0)
-    return EnvStateModel(
-        task_level=env._task_level,
-        current_step=env.steps,
-        max_steps=env.max_steps,
-        total_issues_at_start=total,
-        remaining_issues=len(env.issues),
-        score=env.grade() if total > 0 else 1.0,
-        done=done,
-        current_observation=_obs_to_model(env.get_observation() if not done else None),
-        episode_log=[EpisodeLogEntryModel(**e) for e in env.episode_log],
+def _obs_model(obs: dict | None) -> Optional[ObservationModel]:
+    sanitised = _sanitise_obs(obs)
+    if sanitised is None:
+        return None
+    return ObservationModel(**sanitised)
+
+
+# ---------------------------------------------------------------------------
+# POST /reset
+# ---------------------------------------------------------------------------
+@app.post("/reset")
+async def reset(request: Request, x_session_id: Optional[str] = Header(default=None)):
+    """
+    Start a new episode.
+
+    Accepts an empty body OR {"task_level": "easy"|"medium"|"hard"}.
+    The automated hackathon checker sends an empty POST — this is handled
+    by reading the raw request body and falling back to defaults.
+    """
+    # Parse body flexibly — empty body and missing task_level are both valid
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    task_level = body.get("task_level", "medium") if isinstance(body, dict) else "medium"
+
+    if task_level not in ("easy", "medium", "hard"):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid task_level {task_level!r}. Must be 'easy', 'medium', or 'hard'.",
+        )
+
+    sid = _session_id(x_session_id)
+    env = _get_env(sid)
+    obs = env.reset(task_level=task_level)
+
+    return {"observation": _sanitise_obs(obs)}
+
+
+# ---------------------------------------------------------------------------
+# POST /step
+# ---------------------------------------------------------------------------
+@app.post("/step", response_model=StepResultModel)
+async def step(
+    action_req: ActionModel,
+    x_session_id: Optional[str] = Header(default=None),
+):
+    """
+    Take one action in the current episode.
+
+    action: 0 = skip | 1 = impute_missing | 3 = fix_outlier
+    """
+    sid = _session_id(x_session_id)
+    env = _get_env(sid)
+
+    if env.df is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No active episode. Call POST /reset first.",
+        )
+
+    obs, reward, done, info = env.step(action_req.action)
+
+    return StepResultModel(
+        observation=_obs_model(obs),
+        reward=RewardModel(value=float(reward), done=done, step=env.steps),
+        info=info,
     )
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# GET /state
 # ---------------------------------------------------------------------------
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-@app.post("/reset")
-async def reset(request: Request, x_session_id: Optional[str] = Header(default=None)) -> dict:
+@app.get("/state", response_model=EnvStateModel)
+async def state(x_session_id: Optional[str] = Header(default=None)):
     """
-    Start a new episode. Accepts an optional JSON body with task_level.
-    Works with empty body, null body, or {"task_level": "easy"|"medium"|"hard"}.
+    Return a full snapshot of the current episode without advancing it.
+    Safe to call at any time — has no side effects.
     """
-    sid = x_session_id or DEFAULT_SESSION
+    sid = _session_id(x_session_id)
     env = _get_env(sid)
 
-    # Safely parse body — handle empty, null, or missing body gracefully
-    task_level = "medium"
-    try:
-        body_bytes = await request.body()
-        if body_bytes and body_bytes.strip() and body_bytes.strip() != b"null":
-            import json
-            body_json = json.loads(body_bytes)
-            if isinstance(body_json, dict):
-                task_level = body_json.get("task_level", "medium") or "medium"
-    except Exception:
-        pass  # Fall back to default task_level
+    raw = env.state()
 
-    obs = _obs_to_model(env.reset(task_level=task_level))
-    return {"observation": obs.model_dump() if obs else None}
+    # Sanitise current_observation for Pydantic
+    current_obs = None
+    if raw.get("current_observation") is not None:
+        current_obs = _obs_model(raw["current_observation"])
+
+    return EnvStateModel(
+        task_level=raw["task_level"],
+        current_step=raw["current_step"],
+        max_steps=raw["max_steps"],
+        total_issues_at_start=raw["total_issues_at_start"],
+        remaining_issues=raw["remaining_issues"],
+        score=raw["score"],
+        done=raw["done"],
+        current_observation=current_obs,
+        episode_log=raw["episode_log"],
+    )
 
 
+# ---------------------------------------------------------------------------
+# POST /run  — run a full episode with the baseline agent, return final state
+# ---------------------------------------------------------------------------
+@app.post("/run", response_model=EnvStateModel)
+async def run(
+    run_req: RunRequest,
+    x_session_id: Optional[str] = Header(default=None),
+):
+    """
+    Run a complete episode from start to finish using the baseline agent.
+    Returns the final EnvStateModel. Useful for smoke tests and CI pipelines.
+    """
+    if run_req.task_level not in ("easy", "medium", "hard"):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid task_level {run_req.task_level!r}.",
+        )
+
+    sid = _session_id(x_session_id)
+    env = _get_env(sid)
+    obs = env.reset(task_level=run_req.task_level)
+
+    agent_fn = baseline_agent   # only baseline supported for /run
+    done = False
+
+    while not done:
+        action = agent_fn(obs)
+        obs, _, done, _ = env.step(action)
+
+    raw = env.state()
+    return EnvStateModel(
+        task_level=raw["task_level"],
+        current_step=raw["current_step"],
+        max_steps=raw["max_steps"],
+        total_issues_at_start=raw["total_issues_at_start"],
+        remaining_issues=raw["remaining_issues"],
+        score=raw["score"],
+        done=raw["done"],
+        current_observation=None,
+        episode_log=raw["episode_log"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /upload  — accept any CSV, detect issues, start cleaning episode
+# ---------------------------------------------------------------------------
 @app.post("/upload")
 async def upload(
-    file: UploadFile = File(..., description="CSV file to clean"),
+    file: UploadFile = File(...),
     x_session_id: Optional[str] = Header(default=None),
-) -> dict:
+):
     """
     Upload any CSV file to start a cleaning episode.
 
-    The server auto-detects numeric vs categorical columns and applies
-    IQR-based outlier detection — works with any column names and row counts.
-    The same /step, /state, and /run endpoints work after uploading.
+    Auto-detects numeric vs categorical columns and applies IQR-based
+    outlier detection — works with any column names and row counts.
+
+    Returns the first observation plus dataset metadata.
     """
-    raw = await file.read()
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        text = raw.decode("latin-1")
+    if not file.filename.endswith(".csv"):
+        raise HTTPException(
+            status_code=422,
+            detail="Only CSV files are supported.",
+        )
 
     try:
-        df = pd.read_csv(io.StringIO(text))
+        contents = await file.read()
+        df = pd.read_csv(io.BytesIO(contents))
     except Exception as exc:
-        raise HTTPException(400, f"Could not parse CSV: {exc}")
+        raise HTTPException(
+            status_code=422,
+            detail=f"Could not parse CSV: {exc}",
+        )
 
     if df.empty:
-        raise HTTPException(400, "Uploaded CSV is empty.")
-    if len(df.columns) < 2:
-        raise HTTPException(400, "CSV must have at least 2 columns.")
+        raise HTTPException(status_code=422, detail="Uploaded CSV is empty.")
 
-    sid = x_session_id or DEFAULT_SESSION
+    sid = _session_id(x_session_id)
     env = _get_env(sid)
+
     try:
         obs = env.reset_from_dataframe(df)
     except Exception as exc:
-        raise HTTPException(400, f"Could not load DataFrame: {exc}")
+        raise HTTPException(status_code=422, detail=str(exc))
 
     return {
-        "observation":  _obs_to_model(obs).model_dump() if obs else None,
-        "total_issues": env.total_issues_at_start,
-        "rows":         len(df),
-        "columns":      list(df.columns),
+        "observation":   _sanitise_obs(obs),
+        "total_issues":  env.total_issues_at_start,
+        "rows":          len(df),
+        "columns":       list(df.columns),
     }
 
 
-@app.post("/step")
-def step(body: ActionModel, x_session_id: Optional[str] = Header(default=None)) -> StepResultModel:
-    sid = x_session_id or DEFAULT_SESSION
-    env = _require_env(sid)
-    try:
-        raw_obs, reward_val, done, _ = env.step(body.action)
-    except (IndexError, KeyError):
-        raise HTTPException(400, "Episode is done. Call /reset or /upload first.")
-    return StepResultModel(
-        observation=_obs_to_model(raw_obs),
-        reward=RewardModel(value=float(reward_val), done=done, step=env.steps),
-        info={},
-    )
+# ---------------------------------------------------------------------------
+# GET /health  — liveness probe
+# ---------------------------------------------------------------------------
+@app.get("/health")
+async def health():
+    """Liveness probe. Returns {"status": "ok"} when the server is running."""
+    return {"status": "ok"}
 
 
-@app.get("/state")
-def state(x_session_id: Optional[str] = Header(default=None)) -> EnvStateModel:
-    sid  = x_session_id or DEFAULT_SESSION
-    env  = _require_env(sid)
-    done = len(env.issues) == 0 or env.steps >= env.max_steps
-    return _build_state(env, done=done)
-
-
-@app.post("/run")
-def run(body: RunRequest, x_session_id: Optional[str] = Header(default=None)) -> EnvStateModel:
-    """Run a full episode with the baseline agent and return the final state."""
-    from agent import baseline_agent
-    sid = x_session_id or DEFAULT_SESSION
-    env = _get_env(sid)
-    obs = env.reset(task_level=body.task_level)
-    done = False
-    while not done:
-        obs, _, done, _ = env.step(baseline_agent(obs))
-    return _build_state(env, done=True)
-
-
+# ---------------------------------------------------------------------------
+# Entry point (used by start.sh via uvicorn app:app)
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=False)
