@@ -31,13 +31,13 @@ import argparse
 import json
 import os
 import re
+import sys
 from typing import List, Optional
 
-from openai import OpenAI
-
-from agent import baseline_agent
-from env import DataCleaningEnv
-from models import VALID_ACTIONS
+# ---------------------------------------------------------------------------
+# Force stdout to be unbuffered — guarantees flush even if checker pipes it
+# ---------------------------------------------------------------------------
+sys.stdout.reconfigure(line_buffering=True)
 
 # ---------------------------------------------------------------------------
 # Required environment variables (hackathon spec)
@@ -91,18 +91,52 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
 
 
 # ---------------------------------------------------------------------------
+# Lazy imports — crash inside episode runner, not at module load time
+# This ensures [START] always gets printed even if an import fails mid-run.
+# ---------------------------------------------------------------------------
+def _import_deps():
+    """Import heavy dependencies lazily. Returns (baseline_agent, DataCleaningEnv, VALID_ACTIONS, OpenAI)."""
+    try:
+        from agent import baseline_agent
+    except Exception as e:
+        print(f"[DEBUG] Failed to import agent: {e}", flush=True)
+        baseline_agent = lambda obs: 0
+
+    try:
+        from env import DataCleaningEnv
+    except Exception as e:
+        print(f"[DEBUG] Failed to import env: {e}", flush=True)
+        raise
+
+    try:
+        from models import VALID_ACTIONS
+    except Exception as e:
+        print(f"[DEBUG] Failed to import models: {e}", flush=True)
+        VALID_ACTIONS = {0: "skip", 1: "impute_missing", 3: "fix_outlier"}
+
+    try:
+        from openai import OpenAI
+    except Exception as e:
+        print(f"[DEBUG] openai not available: {e}", flush=True)
+        OpenAI = None
+
+    return baseline_agent, DataCleaningEnv, VALID_ACTIONS, OpenAI
+
+
+# ---------------------------------------------------------------------------
 # LLM Agent — uses OpenAI client as required by hackathon spec
 # ---------------------------------------------------------------------------
 def llm_agent(observation: dict | None) -> int:
     """
     LLM-powered agent using the OpenAI client (mandatory per hackathon spec).
-    Reasons from raw row values + schema rules only.
     Falls back to baseline_agent on any failure.
     """
+    baseline_agent, _, VALID_ACTIONS, OpenAI = _import_deps()
+
     if observation is None:
         return 0
 
-    if not HF_TOKEN:
+    if not HF_TOKEN or OpenAI is None:
         return baseline_agent(observation)
 
     client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
@@ -180,21 +214,22 @@ def llm_agent(observation: dict | None) -> int:
 def run_episode_structured(task_level: str, agent_fn, agent_name: str) -> dict:
     """
     Run one complete episode. Emits [START]/[STEP]/[END] to stdout.
-    Always emits [END] even if an exception occurs.
-    Returns a summary dict for human-readable printing.
+    Always emits [END] even if an exception occurs mid-episode.
     """
-    env  = DataCleaningEnv()
-    obs  = env.reset(task_level=task_level)
+    baseline_agent, DataCleaningEnv, VALID_ACTIONS, _ = _import_deps()
 
     rewards:     List[float] = []
     steps_taken: int         = 0
     score:       float       = 0.0
     success:     bool        = False
+    env                      = None
 
     log_start(task=task_level, env=BENCHMARK, model=agent_name)
 
     try:
-        done     = False
+        env  = DataCleaningEnv()
+        obs  = env.reset(task_level=task_level)
+        done = False
         step_num = 0
 
         while not done:
@@ -223,7 +258,11 @@ def run_episode_structured(task_level: str, agent_fn, agent_name: str) -> dict:
 
     except Exception as exc:
         print(f"[DEBUG] Episode error: {exc}", flush=True)
-        score = round(env.grade(), 2) if hasattr(env, "grade") else 0.0
+        if env is not None and hasattr(env, "grade"):
+            try:
+                score = round(env.grade(), 2)
+            except Exception:
+                score = 0.0
 
     finally:
         log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
@@ -233,9 +272,9 @@ def run_episode_structured(task_level: str, agent_fn, agent_name: str) -> dict:
         "score":        score,
         "total_reward": sum(rewards),
         "steps":        steps_taken,
-        "fixed":        env.total_issues_at_start - len(env.issues),
-        "total_issues": env.total_issues_at_start,
-        "episode_log":  list(env.episode_log),
+        "fixed":        (env.total_issues_at_start - len(env.issues)) if env else 0,
+        "total_issues": env.total_issues_at_start if env else 0,
+        "episode_log":  list(env.episode_log) if env else [],
     }
 
 
@@ -312,11 +351,14 @@ if __name__ == "__main__":
         or (agent_choice == "auto" and _llm_vars_set())
     )
 
+    # Resolve agent functions now (after arg parsing)
+    baseline_agent_fn, _, _, _ = _import_deps()
+
     # ── Baseline ─────────────────────────────────────────────────────────
     baseline_results: list[dict] = []
     if run_baseline:
         for lvl in levels:
-            r = run_episode_structured(lvl, baseline_agent, agent_name="baseline")
+            r = run_episode_structured(lvl, baseline_agent_fn, agent_name="baseline")
             baseline_results.append(r)
 
     # ── LLM agent ────────────────────────────────────────────────────────
