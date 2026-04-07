@@ -22,12 +22,12 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
-    "httpx>=0.27",   # for TestClient in FastAPI tests
+    "httpx>=0.27",
 ]
 
 [project.scripts]
-server    = "app:main"
-inference = "inference:__main__"
+server = "app:main"
+# FIX: removed broken "inference = inference:__main__" — __main__ is not a callable
 
 [build-system]
 requires      = ["setuptools>=68"]

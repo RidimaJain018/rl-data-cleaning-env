@@ -27,7 +27,7 @@ tags:
 # ---------------------------------------------------------------------------
 server:
   module: app
-  app: main
+  app: app        # FIX: was "main" — the FastAPI instance in app.py is named "app"
   host: "0.0.0.0"
   port: 8000
 
