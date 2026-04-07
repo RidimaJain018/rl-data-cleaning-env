@@ -20,7 +20,8 @@ RUN pip install --no-cache-dir \
         python-multipart>=0.0.9 \
         httpx>=0.27 \
         openai>=1.0 \
-        gradio>=4.0
+        gradio>=4.0 \
+        openenv>=0.2.0
 
 COPY models.py     .
 COPY env.py        .
