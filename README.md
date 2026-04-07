@@ -1,6 +1,6 @@
 ---
 title: RL Data Cleaning Agent
-emoji: 🧹
+emoji: 
 colorFrom: purple
 colorTo: green
 sdk: docker
@@ -111,13 +111,13 @@ Each observation is a single row from the dirty 10-column employee DataFrame:
 
 ## Task Descriptions
 
-### 🟢 Easy (20 rows, 8 issues)
+### Easy (20 rows, 8 issues)
 8 missing values spread across 8 different columns: age, city, experience, rating, department, bonus, years_at_company, performance_score. Every correct action is `1` (impute_missing). Seed: 42.
 
-### 🟡 Medium (30 rows, 12 issues)
+### Medium (30 rows, 12 issues)
 5 missing values + 3 salary/bonus outliers + 2 invalid rating scores (> 5) + 1 invalid negative (overtime_hours) + 1 whitespace-padded city. The agent must distinguish imputation (action `1`) from outlier correction (action `3`). Seed: 123.
 
-### 🔴 Hard (50 rows, 20 issues)
+### Hard (50 rows, 20 issues)
 All 7 issue types across 10 columns: 6 missing, 4 outliers (salary/bonus), 2 invalid negatives, 2 duplicate rows, 2 type mismatches (`age="N/A"`, `years_at_company="ten"`), 2 whitespace-padded strings, 2 invalid rating scores. Seed: 999.
 
 ---
