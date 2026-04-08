@@ -1,24 +1,6 @@
 """
 inference.py — Run DataCleaningEnv episodes with different agents
 =================================================================
-Default behaviour (no flags):
-  - Always runs the baseline agent across all three task levels.
-  - If API_BASE_URL + HF_TOKEN are set, also runs the LLM agent.
-
-Required environment variables (hackathon spec):
-    API_BASE_URL   Base URL for the LLM API endpoint
-    MODEL_NAME     The model identifier to use for inference
-    HF_TOKEN       Your Hugging Face / API key
-
-Optional:
-    AGENT_TYPE     "baseline" or "llm" (overrides --agent flag)
-
-Usage
------
-    python inference.py                          # baseline on all tasks
-    python inference.py --agent llm --task hard  # LLM on hard only
-    python inference.py --agent both             # both agents, all tasks
-
 STDOUT FORMAT (required by hackathon checker — do not change):
     [START] task=<task_name> env=<benchmark> model=<model_name>
     [STEP]  step=<n> action=<action_str> reward=0.00 done=<true|false> error=<msg|null>
@@ -27,7 +9,6 @@ STDOUT FORMAT (required by hackathon checker — do not change):
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import re
@@ -35,7 +16,7 @@ import sys
 from typing import List, Optional
 
 # ---------------------------------------------------------------------------
-# Force stdout to be unbuffered — guarantees flush even if checker pipes it
+# Force stdout unbuffered — works whether checker pipes or captures output
 # ---------------------------------------------------------------------------
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -44,30 +25,13 @@ sys.stdout.reconfigure(line_buffering=True)
 # ---------------------------------------------------------------------------
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME   = os.getenv("MODEL_NAME",   "meta-llama/Llama-3.2-3B-Instruct")
-HF_TOKEN     = os.getenv("HF_TOKEN") or os.getenv("API_KEY", "")
+HF_TOKEN     = os.getenv("HF_TOKEN", "")
 
-# Benchmark name emitted in [START] line
-BENCHMARK = "data-cleaning-env"
-
-# Score threshold to call an episode "successful"
+BENCHMARK               = "data-cleaning-env"
 SUCCESS_SCORE_THRESHOLD = 0.5
 
-# ── Colours (disabled when not a TTY so checker output stays clean) ────────
-_IS_TTY = os.isatty(1)
-def _c(code: str, text: str) -> str:
-    return f"\033[{code}m{text}\033[0m" if _IS_TTY else text
-
-GREEN  = lambda t: _c("32", t)
-YELLOW = lambda t: _c("33", t)
-BOLD   = lambda t: _c("1",  t)
-DIM    = lambda t: _c("2",  t)
-RED    = lambda t: _c("31", t)
-
-
 # ---------------------------------------------------------------------------
-# Official structured stdout loggers
-# These three functions produce the EXACT format the checker parses.
-# Do NOT change field names, ordering, or formatting.
+# Official structured stdout loggers — exact format the checker parses
 # ---------------------------------------------------------------------------
 def log_start(task: str, env: str, model: str) -> None:
     print(f"[START] task={task} env={env} model={model}", flush=True)
@@ -91,101 +55,101 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
 
 
 # ---------------------------------------------------------------------------
-# Lazy imports — crash inside episode runner, not at module load time
-# This ensures [START] always gets printed even if an import fails mid-run.
+# Baseline agent (inline — no import needed, guaranteed to work)
 # ---------------------------------------------------------------------------
-def _import_deps():
-    """Import heavy dependencies lazily. Returns (baseline_agent, DataCleaningEnv, VALID_ACTIONS, OpenAI)."""
-    try:
-        from agent import baseline_agent
-    except Exception as e:
-        print(f"[DEBUG] Failed to import agent: {e}", flush=True)
-        baseline_agent = lambda obs: 0
+def _baseline_agent(observation: dict | None) -> int:
+    if observation is None:
+        return 0
+    row = observation["row_data"]
 
-    try:
-        from env import DataCleaningEnv
-    except Exception as e:
-        print(f"[DEBUG] Failed to import env: {e}", flush=True)
-        raise
+    EXPECTED_NUMERIC = {
+        "age", "salary", "experience", "rating",
+        "bonus", "years_at_company", "performance_score", "overtime_hours",
+    }
+    OUTLIER_THRESHOLDS = {"salary": 300_000, "bonus": 80_000}
+    SCORE_COLS = {"rating", "performance_score"}
 
-    try:
-        from models import VALID_ACTIONS
-    except Exception as e:
-        print(f"[DEBUG] Failed to import models: {e}", flush=True)
-        VALID_ACTIONS = {0: "skip", 1: "impute_missing", 3: "fix_outlier"}
+    for key, val in row.items():
+        if key in EXPECTED_NUMERIC and isinstance(val, str):
+            try:
+                float(val)
+            except (ValueError, TypeError):
+                return 3
+
+    for val in row.values():
+        if isinstance(val, str) and val != val.strip():
+            return 3
+
+    for key, val in row.items():
+        if key in OUTLIER_THRESHOLDS and isinstance(val, (int, float)):
+            if val > OUTLIER_THRESHOLDS[key]:
+                return 3
+
+    for key, val in row.items():
+        if key in SCORE_COLS and isinstance(val, (int, float)):
+            if val > 5:
+                return 3
+
+    for key, val in row.items():
+        if key in EXPECTED_NUMERIC and isinstance(val, (int, float)):
+            if val < 0:
+                return 3
+
+    for val in row.values():
+        if val is None or (isinstance(val, float) and str(val) == "nan"):
+            return 1
+
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# LLM Agent
+# ---------------------------------------------------------------------------
+def _llm_agent(observation: dict | None) -> int:
+    if observation is None:
+        return 0
+    if not HF_TOKEN:
+        return _baseline_agent(observation)
 
     try:
         from openai import OpenAI
-    except Exception as e:
-        print(f"[DEBUG] openai not available: {e}", flush=True)
-        OpenAI = None
+        client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
+        row = observation["row_data"]
 
-    return baseline_agent, DataCleaningEnv, VALID_ACTIONS, OpenAI
+        row_lines = []
+        for col, val in row.items():
+            if val is None or (isinstance(val, float) and str(val) == "nan"):
+                row_lines.append(f"  {col}: NULL")
+            elif isinstance(val, str):
+                row_lines.append(f"  {col}: \"{val}\"")
+            else:
+                row_lines.append(f"  {col}: {val}")
 
+        system_prompt = (
+            "You are an expert data quality analyst reviewing rows from an employee dataset.\n\n"
+            "DATASET SCHEMA AND VALID RANGES:\n"
+            "  age              : integer, valid range 22-62\n"
+            "  salary           : integer USD, valid range 35000-180000\n"
+            "  city             : string, one of [NY, LA, SF, Chicago, Austin, Seattle, Boston, Denver]\n"
+            "  experience       : integer years, valid range 0-30\n"
+            "  rating           : float, valid range 0.0-5.0\n"
+            "  department       : string, one of [Engineering, Sales, HR, Marketing, Finance, Operations]\n"
+            "  bonus            : integer USD, valid range 0-25000\n"
+            "  years_at_company : integer years, valid range 0-20\n"
+            "  performance_score: float, valid range 0.0-5.0\n"
+            "  overtime_hours   : integer, valid range 0-80\n\n"
+            "ACTIONS:\n"
+            "  0 = skip           - row has no data quality issue\n"
+            "  1 = impute_missing - row has a NULL / missing cell\n"
+            "  3 = fix_outlier    - row has any other issue\n\n"
+            "Respond ONLY with JSON: {\"action\": <0|1|3>, \"reason\": \"<one sentence>\"}"
+        )
+        user_prompt = (
+            "Examine this employee record:\n\n"
+            + "\n".join(row_lines)
+            + "\n\nRespond ONLY with JSON: {\"action\": <0|1|3>, \"reason\": \"...\"}"
+        )
 
-# ---------------------------------------------------------------------------
-# LLM Agent — uses OpenAI client as required by hackathon spec
-# ---------------------------------------------------------------------------
-def llm_agent(observation: dict | None) -> int:
-    """
-    LLM-powered agent using the OpenAI client (mandatory per hackathon spec).
-    Falls back to baseline_agent on any failure.
-    """
-    baseline_agent, _, VALID_ACTIONS, OpenAI = _import_deps()
-
-    if observation is None:
-        return 0
-
-    if not HF_TOKEN or OpenAI is None:
-        return baseline_agent(observation)
-
-    client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
-    row    = observation["row_data"]
-
-    row_lines = []
-    for col, val in row.items():
-        if val is None or (isinstance(val, float) and str(val) == "nan"):
-            row_lines.append(f"  {col}: NULL")
-        elif isinstance(val, str):
-            row_lines.append(f"  {col}: \"{val}\"")
-        else:
-            row_lines.append(f"  {col}: {val}")
-
-    system_prompt = (
-        "You are an expert data quality analyst reviewing rows from an employee dataset.\n\n"
-        "DATASET SCHEMA AND VALID RANGES:\n"
-        "  age              : integer, valid range 22-62\n"
-        "  salary           : integer USD, valid range 35000-180000\n"
-        "  city             : string, one of [NY, LA, SF, Chicago, Austin, Seattle, Boston, Denver]\n"
-        "  experience       : integer years, valid range 0-30\n"
-        "  rating           : float, valid range 0.0-5.0\n"
-        "  department       : string, one of [Engineering, Sales, HR, Marketing, Finance, Operations]\n"
-        "  bonus            : integer USD, valid range 0-25000\n"
-        "  years_at_company : integer years, valid range 0-20\n"
-        "  performance_score: float, valid range 0.0-5.0\n"
-        "  overtime_hours   : integer, valid range 0-80\n\n"
-        "ISSUE TYPES TO DETECT:\n"
-        "  - NULL value: any cell showing NULL or missing\n"
-        "  - Outlier: numeric value far outside the valid range shown above\n"
-        "  - Invalid rating: rating or performance_score above 5.0\n"
-        "  - Invalid negative: negative value in a column that must be >= 0\n"
-        "  - Type mismatch: non-numeric string (e.g. 'N/A', 'ten') in a numeric column\n"
-        "  - Whitespace padding: string with leading or trailing spaces\n\n"
-        "ACTIONS:\n"
-        "  0 = skip           - row has no data quality issue\n"
-        "  1 = impute_missing - row has a NULL / missing cell\n"
-        "  3 = fix_outlier    - row has any other issue (outlier, invalid value,\n"
-        "                       type mismatch, whitespace padding)\n\n"
-        "Respond ONLY with JSON: {\"action\": <0|1|3>, \"reason\": \"<one sentence>\"}"
-    )
-
-    user_prompt = (
-        "Examine this employee record and identify any data quality issue:\n\n"
-        + "\n".join(row_lines)
-        + "\n\nRespond ONLY with JSON: {\"action\": <0|1|3>, \"reason\": \"...\"}"
-    )
-
-    try:
         response = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
@@ -203,20 +167,18 @@ def llm_agent(observation: dict | None) -> int:
         except (json.JSONDecodeError, KeyError, ValueError):
             m = re.search(r'"action"\s*:\s*(\d)', raw)
             action = int(m.group(1)) if m else 0
-        return action if action in VALID_ACTIONS else 0
+
+        return action if action in {0, 1, 3} else 0
+
     except Exception:
-        return baseline_agent(observation)
+        return _baseline_agent(observation)
 
 
 # ---------------------------------------------------------------------------
-# Episode runner — emits official structured stdout per the checker spec
+# Episode runner
 # ---------------------------------------------------------------------------
-def run_episode_structured(task_level: str, agent_fn, agent_name: str) -> dict:
-    """
-    Run one complete episode. Emits [START]/[STEP]/[END] to stdout.
-    Always emits [END] even if an exception occurs mid-episode.
-    """
-    baseline_agent, DataCleaningEnv, VALID_ACTIONS, _ = _import_deps()
+def run_episode(task_level: str, agent_fn, agent_name: str) -> dict:
+    VALID_ACTIONS = {0: "skip", 1: "impute_missing", 3: "fix_outlier"}
 
     rewards:     List[float] = []
     steps_taken: int         = 0
@@ -227,31 +189,22 @@ def run_episode_structured(task_level: str, agent_fn, agent_name: str) -> dict:
     log_start(task=task_level, env=BENCHMARK, model=agent_name)
 
     try:
-        env  = DataCleaningEnv()
-        obs  = env.reset(task_level=task_level)
-        done = False
+        from env import DataCleaningEnv
+        env      = DataCleaningEnv()
+        obs      = env.reset(task_level=task_level)
+        done     = False
         step_num = 0
 
         while not done:
-            step_num += 1
+            step_num    += 1
             action_id    = agent_fn(obs)
             action_label = VALID_ACTIONS.get(action_id, str(action_id))
-
             obs, reward, done, info = env.step(action_id)
-
             reward_f = float(reward)
             rewards.append(reward_f)
             steps_taken = step_num
-
             error = info.get("error") if isinstance(info, dict) else None
-
-            log_step(
-                step   = step_num,
-                action = action_label,
-                reward = reward_f,
-                done   = done,
-                error  = error,
-            )
+            log_step(step=step_num, action=action_label, reward=reward_f, done=done, error=error)
 
         score   = round(env.grade(), 2)
         success = score >= SUCCESS_SCORE_THRESHOLD
@@ -272,112 +225,32 @@ def run_episode_structured(task_level: str, agent_fn, agent_name: str) -> dict:
         "score":        score,
         "total_reward": sum(rewards),
         "steps":        steps_taken,
-        "fixed":        (env.total_issues_at_start - len(env.issues)) if env else 0,
-        "total_issues": env.total_issues_at_start if env else 0,
-        "episode_log":  list(env.episode_log) if env else [],
     }
 
 
 # ---------------------------------------------------------------------------
-# Human-readable printers (printed AFTER all structured blocks)
+# Main — runs unconditionally at module load time.
+# This guarantees output whether the checker does:
+#   python inference.py          (direct execution)
+#   python -m inference          (module execution)
+#   import inference             (import — __main__ guard would silently skip)
 # ---------------------------------------------------------------------------
-SEP = "─" * 52
+def main():
+    agent_choice = os.environ.get("AGENT_TYPE", "baseline")
+    levels       = ("easy", "medium", "hard")
 
-def print_results(results: list[dict], agent_name: str) -> None:
-    print(f"\n{BOLD('=== RESULTS — ' + agent_name.upper() + ' AGENT ===')}\n")
-    print(f"{'Task':<8} {'Score':>6} {'Reward':>8} {'Steps':>6} {'Fixed':>7}")
-    print(SEP)
-    for r in results:
-        score_str = GREEN(f"{r['score']:>6.2f}") if r['score'] == 1.0 else YELLOW(f"{r['score']:>6.2f}")
-        print(
-            f"{r['task']:<8} {score_str} {r['total_reward']:>8.1f} "
-            f"{r['steps']:>6} {r['fixed']}/{r['total_issues']}"
-        )
-    avg = sum(r["score"] for r in results) / len(results)
-    avg_str = GREEN(f"{avg:>6.2f}") if avg == 1.0 else YELLOW(f"{avg:>6.2f}")
-    print(SEP)
-    print(f"{'Average':>8} {avg_str}")
+    run_baseline = (agent_choice in ("baseline", "both", "auto")) or (not HF_TOKEN)
+    run_llm      = (agent_choice in ("llm", "both")) and bool(HF_TOKEN)
 
-
-def print_episode_summary(results: list[dict], agent_name: str) -> None:
-    print(f"\n{BOLD('Issue-type accuracy — ' + agent_name.upper())}")
-    from collections import defaultdict
-    issue_stats: dict[str, dict] = defaultdict(lambda: {"correct": 0, "total": 0})
-    for r in results:
-        for e in r.get("episode_log", []):
-            issue_stats[e["issue"]]["total"] += 1
-            if e["correct"]:
-                issue_stats[e["issue"]]["correct"] += 1
-    print(f"  {'Issue type':<24} {'Correct':>7} {'Total':>6} {'Accuracy':>9}")
-    print(f"  {'─'*24} {'─'*7} {'─'*6} {'─'*9}")
-    for issue, s in sorted(issue_stats.items()):
-        acc     = s["correct"] / s["total"] if s["total"] > 0 else 0
-        acc_str = GREEN(f"{acc:>9.0%}") if acc == 1.0 else YELLOW(f"{acc:>9.0%}")
-        print(f"  {issue:<24} {s['correct']:>7} {s['total']:>6} {acc_str}")
-
-
-# ---------------------------------------------------------------------------
-# LLM availability check
-# ---------------------------------------------------------------------------
-def _llm_vars_set() -> bool:
-    return bool(HF_TOKEN and API_BASE_URL)
-
-
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run DataCleaningEnv inference.")
-    parser.add_argument(
-        "--agent", choices=["baseline", "llm", "both"], default="auto",
-        help=(
-            "Agent to use. 'auto': always runs baseline; "
-            "also runs LLM if API_BASE_URL + HF_TOKEN are set."
-        ),
-    )
-    parser.add_argument(
-        "--task", choices=["easy", "medium", "hard", "all"], default="all",
-        help="Task difficulty to run (default: all)",
-    )
-    args = parser.parse_args()
-
-    agent_choice = os.environ.get("AGENT_TYPE", args.agent)
-    levels       = ("easy", "medium", "hard") if args.task == "all" else (args.task,)
-
-    run_baseline = agent_choice in ("baseline", "both", "auto")
-    run_llm      = (
-        agent_choice == "llm"
-        or agent_choice == "both"
-        or (agent_choice == "auto" and _llm_vars_set())
-    )
-
-    # Resolve agent functions now (after arg parsing)
-    baseline_agent_fn, _, _, _ = _import_deps()
-
-    # ── Baseline ─────────────────────────────────────────────────────────
-    baseline_results: list[dict] = []
     if run_baseline:
         for lvl in levels:
-            r = run_episode_structured(lvl, baseline_agent_fn, agent_name="baseline")
-            baseline_results.append(r)
+            run_episode(lvl, _baseline_agent, agent_name="baseline")
 
-    # ── LLM agent ────────────────────────────────────────────────────────
-    llm_results: list[dict] = []
     if run_llm:
         for lvl in levels:
-            r = run_episode_structured(lvl, llm_agent, agent_name=MODEL_NAME)
-            llm_results.append(r)
+            run_episode(lvl, _llm_agent, agent_name=MODEL_NAME)
 
-    # ── Human-readable summary (after all structured blocks) ──────────────
-    if baseline_results:
-        print_results(baseline_results, "baseline")
-        print_episode_summary(baseline_results, "baseline")
 
-    if llm_results:
-        print_results(llm_results, "llm")
-        print_episode_summary(llm_results, "llm")
-
-    if not run_llm and agent_choice == "auto":
-        print(
-            f"\n{DIM('Tip: set HF_TOKEN + API_BASE_URL + MODEL_NAME to also run the LLM agent.')}"
-        )
+# Unconditional call — no __main__ guard intentionally.
+# Works for direct execution AND import-based invocation by the checker.
+main()
