@@ -1,6 +1,6 @@
 """
-inference.py — Run DataCleaningEnv episodes locally (no HTTP needed)
-=====================================================================
+inference.py — Run DataCleaningEnv episodes locally with LLM agent
+===================================================================
 Runs the environment by importing env.py directly — works inside the
 hackathon checker's Docker container and locally.
 
@@ -28,11 +28,12 @@ except Exception:
     pass
 
 # ---------------------------------------------------------------------------
-# Environment variables (hackathon spec)
+# Environment variables
+# Checker injects API_KEY and API_BASE_URL — we read both
 # ---------------------------------------------------------------------------
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME   = os.getenv("MODEL_NAME",   "meta-llama/Llama-3.2-3B-Instruct")
-HF_TOKEN     = os.getenv("HF_TOKEN", "")
+MODEL_NAME   = os.getenv("MODEL_NAME", "meta-llama/Llama-3.2-3B-Instruct")
+HF_TOKEN     = os.getenv("API_KEY") or os.getenv("HF_TOKEN", "")
 
 BENCHMARK               = "data-cleaning-env"
 SUCCESS_SCORE_THRESHOLD = 0.5
@@ -63,7 +64,6 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
 # NaN-safe helper — pandas returns float('nan') for missing, not None
 # ---------------------------------------------------------------------------
 def _is_missing(val) -> bool:
-    """Return True if val is None or float NaN."""
     if val is None:
         return True
     if isinstance(val, float) and math.isnan(val):
@@ -71,7 +71,7 @@ def _is_missing(val) -> bool:
     return False
 
 # ---------------------------------------------------------------------------
-# Baseline agent — rule-based, handles both None and float NaN missing values
+# Baseline agent — fallback only, used when LLM call fails
 # ---------------------------------------------------------------------------
 EXPECTED_NUMERIC   = {"age", "salary", "experience", "rating", "bonus",
                       "years_at_company", "performance_score", "overtime_hours"}
@@ -80,17 +80,16 @@ SCORE_COLS         = {"rating", "performance_score"}
 
 
 def _baseline_agent(observation) -> int:
-    """Rule-based agent. Returns 0=skip, 1=impute_missing, 3=fix_outlier."""
+    """Rule-based fallback agent. Returns 0=skip, 1=impute_missing, 3=fix_outlier."""
     if observation is None:
         return 0
 
-    # Handle both dict (from local env) and object (from HTTP client)
     if isinstance(observation, dict):
         row_data = observation["row_data"]
     else:
         row_data = observation.row_data
 
-    # 1 — type mismatch: non-parseable string in a numeric column
+    # type mismatch: non-parseable string in a numeric column
     for key, val in row_data.items():
         if key in EXPECTED_NUMERIC and isinstance(val, str):
             try:
@@ -98,44 +97,41 @@ def _baseline_agent(observation) -> int:
             except (ValueError, TypeError):
                 return 3
 
-    # 2 — whitespace padding
+    # whitespace padding
     for val in row_data.values():
         if isinstance(val, str) and val != val.strip():
             return 3
 
-    # 3 — column-specific outlier thresholds
+    # column-specific outlier thresholds
     for key, val in row_data.items():
         if key in OUTLIER_THRESHOLDS and isinstance(val, (int, float)) and not _is_missing(val):
             if val > OUTLIER_THRESHOLDS[key]:
                 return 3
 
-    # 4 — invalid score range (> 5)
+    # invalid score range (> 5)
     for key, val in row_data.items():
         if key in SCORE_COLS and isinstance(val, (int, float)) and not _is_missing(val):
             if val > 5:
                 return 3
 
-    # 5 — invalid negative in numeric column
+    # invalid negative in numeric column
     for key, val in row_data.items():
         if key in EXPECTED_NUMERIC and isinstance(val, (int, float)) and not _is_missing(val):
             if val < 0:
                 return 3
 
-    # 6 — missing value (None OR float NaN from pandas)
+    # missing value (None OR float NaN from pandas)
     for val in row_data.values():
         if _is_missing(val):
             return 1
 
-    # 7 — no issue detected
     return 0
 
 
 # ---------------------------------------------------------------------------
-# LLM agent — calls HF inference API, falls back to baseline on any error
+# LLM agent — always called; falls back to baseline only on API error
 # ---------------------------------------------------------------------------
 def _llm_agent(observation) -> int:
-    if not HF_TOKEN:
-        return _baseline_agent(observation)
     try:
         from openai import OpenAI
         client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
@@ -182,7 +178,9 @@ def _llm_agent(observation) -> int:
             m = re.search(r'"action"\s*:\s*(\d)', raw)
             action = int(m.group(1)) if m else 0
         return action if action in {0, 1, 3} else 0
-    except Exception:
+
+    except Exception as exc:
+        print(f"[DEBUG] LLM call failed, using baseline: {exc}", file=sys.stderr, flush=True)
         return _baseline_agent(observation)
 
 
@@ -195,7 +193,7 @@ VALID_ACTIONS = {0: "skip", 1: "impute_missing", 3: "fix_outlier"}
 # ---------------------------------------------------------------------------
 # Episode runner — uses local DataCleaningEnv directly (no HTTP)
 # ---------------------------------------------------------------------------
-def run_episode(task_level: str, use_llm: bool, agent_name: str) -> dict:
+def run_episode(task_level: str, agent_name: str) -> dict:
     rewards:     List[float] = []
     steps_taken: int         = 0
     score:       float       = 0.0
@@ -211,7 +209,8 @@ def run_episode(task_level: str, use_llm: bool, agent_name: str) -> dict:
         while not done:
             steps_taken += 1
 
-            action_id    = _llm_agent(obs) if use_llm else _baseline_agent(obs)
+            # Always use LLM agent — checker requires API calls through proxy
+            action_id    = _llm_agent(obs)
             action_label = VALID_ACTIONS.get(action_id, str(action_id))
 
             obs, reward, done, _info = env.step(action_id)
@@ -225,7 +224,6 @@ def run_episode(task_level: str, use_llm: bool, agent_name: str) -> dict:
         success   = score >= SUCCESS_SCORE_THRESHOLD
 
     except Exception as exc:
-        # Send errors to stderr only — stdout must stay clean for the checker
         print(f"[DEBUG] Episode error in {task_level}: {exc}", file=sys.stderr, flush=True)
 
     finally:
@@ -235,22 +233,12 @@ def run_episode(task_level: str, use_llm: bool, agent_name: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Main — guarded so module-level import doesn't auto-run episodes
+# Main — always runs all 3 levels with LLM agent
 # ---------------------------------------------------------------------------
 def main():
-    agent_choice = os.environ.get("AGENT_TYPE", "baseline")
-    levels       = ("easy", "medium", "hard")
-
-    run_baseline = (agent_choice in ("baseline", "both", "auto")) or (not HF_TOKEN)
-    run_llm      = (agent_choice in ("llm", "both")) and bool(HF_TOKEN)
-
-    if run_baseline:
-        for lvl in levels:
-            run_episode(lvl, use_llm=False, agent_name="baseline")
-
-    if run_llm:
-        for lvl in levels:
-            run_episode(lvl, use_llm=True, agent_name=MODEL_NAME)
+    levels = ("easy", "medium", "hard")
+    for lvl in levels:
+        run_episode(lvl, agent_name=MODEL_NAME)
 
 
 if __name__ == "__main__":
