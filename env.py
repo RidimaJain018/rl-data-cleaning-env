@@ -486,7 +486,7 @@ class DataCleaningEnv:
             "max_steps":             self.max_steps,
             "total_issues_at_start": total,
             "remaining_issues":      len(self.issues),
-            "score":                 self.grade() if total > 0 else 1.0,
+            "score":                 self.grade() if total > 0 else 0.99,
             "done":                  done,
             "current_observation":   self.get_observation(),
             "episode_log":           list(self.episode_log),
@@ -498,5 +498,7 @@ class DataCleaningEnv:
     def grade(self) -> float:
         total = getattr(self, "total_issues_at_start", 0)
         if total == 0:
-            return 1.0
-        return round((total - len(self.issues)) / total, 3)
+            return 0.99  # clamp: checker requires strictly < 1.0
+        raw = (total - len(self.issues)) / total
+        # Clamp to open interval (0, 1) — checker rejects exactly 0.0 or 1.0
+        return round(min(max(raw, 0.01), 0.99), 4)
