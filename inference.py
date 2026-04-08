@@ -21,9 +21,12 @@ from typing import List, Optional
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # ---------------------------------------------------------------------------
-# Force stdout unbuffered — works whether checker pipes or captures output
+# Force stdout unbuffered — safe even if checker replaces sys.stdout
 # ---------------------------------------------------------------------------
-sys.stdout.reconfigure(line_buffering=True)
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass  # checker may replace stdout with a pipe; that's fine, flush=True handles it
 
 # ---------------------------------------------------------------------------
 # Required environment variables (hackathon spec)
