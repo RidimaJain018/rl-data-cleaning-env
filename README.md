@@ -1,6 +1,5 @@
 ---
 title: RL Data Cleaning Agent
-emoji: 
 colorFrom: purple
 colorTo: green
 sdk: docker
