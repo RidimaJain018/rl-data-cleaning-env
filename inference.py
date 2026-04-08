@@ -16,6 +16,11 @@ import sys
 from typing import List, Optional
 
 # ---------------------------------------------------------------------------
+# Ensure env.py is always importable regardless of the checker's cwd
+# ---------------------------------------------------------------------------
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# ---------------------------------------------------------------------------
 # Force stdout unbuffered — works whether checker pipes or captures output
 # ---------------------------------------------------------------------------
 sys.stdout.reconfigure(line_buffering=True)
