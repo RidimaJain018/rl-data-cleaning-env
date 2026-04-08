@@ -21,12 +21,32 @@ This project frames **data cleaning as a sequential decision-making problem**: a
 
 The environment is fully compliant with the **OpenEnv 3-method interface** (`reset` / `step` / `state`) and is deployable as a Hugging Face Space with a Docker runtime.
 
+**Key differentiator — CSV Upload:** Beyond the three built-in task levels, the `/upload` endpoint and Gradio UI accept *any* CSV file. The environment auto-detects column types, applies IQR-based outlier detection, and runs a full cleaning episode — all without any prior schema knowledge. This demonstrates the core value of the RL framing: generalisation to unseen data.
+
 The choices involved in data cleaning — *should I impute this missing value or is this an outlier?* — are **sequential and context-dependent**, making RL a natural fit:
 
 - **State**: the current dirty row being inspected
 - **Action**: skip / impute_missing / fix_outlier
 - **Reward**: +2 per correct fix, −1 for wrong actions, +5 completion bonus
 - **Goal**: clean the entire dataset with maximum accuracy and minimum wasted steps
+
+---
+
+## Why RL over Rule-Based Cleaning?
+
+A deterministic rule-based agent works well on the built-in dataset because the schema is fixed and known in advance. But rule-based agents break the moment the data changes:
+
+| Scenario | Rule-Based Agent | RL Agent |
+|----------|-----------------|----------|
+| Known schema, fixed thresholds | ✅ Works perfectly | ✅ Works |
+| Unknown CSV with new column names | ❌ No rules to apply | ✅ Generalises via observation |
+| Ambiguous cells (numeric string vs type mismatch) | ❌ Brittle regex | ✅ Learns from reward signal |
+| Changing outlier distributions over time | ❌ Hardcoded thresholds go stale | ✅ Can be retrained |
+| Multi-step context ("this column is mostly clean so this looks like an outlier") | ❌ Single-row heuristics | ✅ Sequential reasoning |
+
+The **CSV Upload** feature in this project demonstrates real-world generalisation: drop in any CSV with any column names and the agent adapts without any schema knowledge.
+
+> **Score note:** Agent scores are reported in the open interval `(0, 1)` — a score of `0.99` means 99% of issues were resolved. A perfect rule-based score of `1.0` would be trivial to hardcode; the RL framing makes partial credit and generalisation meaningful.
 
 ---
 

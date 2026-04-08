@@ -193,7 +193,55 @@ def _card(top, big, bot, color=None):
     )
 
 
-def _summary(label, score, steps, reward, fixed, total, agent_name="baseline"):
+def _score_bar(score: float) -> str:
+    """Render a visual progress bar for score (0-1)."""
+    pct = round(score * 100)
+    color = TEAL if pct >= 80 else BEIGE if pct >= 50 else DIRTY_RED
+    return (
+        f"<div style='margin-top:8px;'>"
+        f"<div style='background:{SURFACE2};border-radius:99px;height:6px;overflow:hidden;'>"
+        f"<div style='width:{pct}%;height:100%;background:{color};"
+        f"border-radius:99px;transition:width 0.4s ease;'></div></div>"
+        f"<div style='font-size:0.58rem;color:{SUBTEXT};font-family:DM Mono,monospace;"
+        f"margin-top:4px;text-align:right;'>{pct}% issues resolved</div>"
+        f"</div>"
+    )
+
+
+def _issue_breakdown(env) -> str:
+    """Render coloured pills showing count of each issue type fixed."""
+    from collections import Counter
+    if not env.episode_log:
+        return ""
+    counts = Counter(e["issue"] for e in env.episode_log if e["correct"])
+    if not counts:
+        return ""
+    issue_colors = {
+        "missing":           TEAL,
+        "outlier":           BEIGE,
+        "invalid_rating":    "#E8A87C",
+        "invalid_negative":  "#D4A5E0",
+        "duplicate":         "#7EC8C8",
+        "type_mismatch":     "#F0C674",
+        "whitespace_padding":"#95C17B",
+    }
+    pills = "".join(
+        f"<span style='background:{issue_colors.get(k, SUBTEXT)}22;"
+        f"border:1px solid {issue_colors.get(k, SUBTEXT)}66;"
+        f"color:{issue_colors.get(k, TEXT)};font-size:0.58rem;"
+        f"font-family:DM Mono,monospace;padding:3px 9px;border-radius:20px;"
+        f"white-space:nowrap;'>{k.replace('_',' ')} ×{v}</span>"
+        for k, v in sorted(counts.items())
+    )
+    return (
+        f"<div style='display:flex;flex-wrap:wrap;gap:6px;margin-top:12px;'>"
+        f"<span style='font-size:0.58rem;font-family:DM Mono,monospace;"
+        f"color:{SUBTEXT};align-self:center;letter-spacing:0.08em;'>FIXED:</span>"
+        + pills + "</div>"
+    )
+
+
+def _summary(label, score, steps, reward, fixed, total, agent_name="baseline", env=None):
     pct   = str(round(score * 100)) + "%"
     rew_s = ("+" if reward > 0 else "") + str(reward)
     badge = (
@@ -212,10 +260,13 @@ def _summary(label, score, steps, reward, fixed, total, agent_name="baseline"):
         + _card("Reward", rew_s, "Total reward", TEAL)
         + _card("Fixed", fixed_str, "Issues resolved")
     )
+    breakdown = _issue_breakdown(env) if env else ""
     return (
         f"<div style='margin-bottom:10px;'>{badge}</div>"
         "<div style='display:grid;grid-template-columns:repeat(4,1fr);gap:12px;'>"
         + cards + "</div>"
+        + _score_bar(score)
+        + breakdown
     )
 
 
@@ -229,6 +280,7 @@ def _summary_all(rows, agent_name="baseline"):
     cards = "".join(
         _card(t.upper(), str(round(s * 100)) + "%",
               f"{f}/{n} fixed · {st} steps · {('+' if r > 0 else '')}{r}", BEIGE)
+        + _score_bar(s)
         for t, s, st, r, f, n in rows
     )
     return (
@@ -272,7 +324,7 @@ def run_task(task_level, agent_type, api_key, base_url, model):
         rew += r
     fixed = sum(1 for e in env.episode_log if e["correct"])
     return (
-        _summary(task_level, env.grade(), env.steps, rew, fixed, env.total_issues_at_start, agent_name),
+        _summary(task_level, env.grade(), env.steps, rew, fixed, env.total_issues_at_start, agent_name, env),
         df_to_html(env.original_df),
         df_to_html(env.df),
         df_to_html(_trace_df(env)),
@@ -376,7 +428,7 @@ def run_upload(file_obj, csv_text):
     )
     return (
         note + _summary("custom", env.grade(), env.steps, rew,
-                        fixed, env.total_issues_at_start, "baseline"),
+                        fixed, env.total_issues_at_start, "baseline", env),
         df_to_html(env.original_df),
         df_to_html(env.df),
         df_to_html(_trace_df(env)),
@@ -482,15 +534,36 @@ CTRL_HTML = (
 with gr.Blocks(css=css, title="RL Data Cleaning Agent") as demo:
 
     gr.HTML(
-        f"<div class='gd-header'><div style='display:flex;justify-content:space-between;"
-        "align-items:flex-start;flex-wrap:wrap;gap:10px;'>"
-        "<div><h1 class='gd-title'>RL Data Cleaning Agent</h1>"
-        f"<p class='gd-sub'>Meta × Scaler OpenEnv Hackathon &nbsp;·&nbsp; "
-        "Reinforcement Learning Environment</p></div>"
+        f"<div class='gd-header'>"
+        f"<div style='display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px;margin-bottom:14px;'>"
+        f"<div><h1 class='gd-title'>RL Data Cleaning Agent</h1>"
+        f"<p class='gd-sub'>Meta × Scaler OpenEnv Hackathon &nbsp;·&nbsp; Reinforcement Learning Environment</p></div>"
+        f"<div style='display:flex;gap:8px;flex-wrap:wrap;align-items:center;'>"
+        f"<span style='background:{PURPLE}33;border:1px solid {PURPLE};color:{LAVENDER};"
+        f"font-size:0.58rem;font-family:DM Mono,monospace;letter-spacing:0.1em;"
+        f"padding:4px 12px;border-radius:20px;text-transform:uppercase;'>&#127942; OpenEnv Hackathon</span>"
         f"<span style='background:{SURFACE2};border:1px solid {BEIGE}33;color:{BEIGE};"
-        "font-size:0.6rem;font-family:DM Mono,monospace;letter-spacing:0.1em;"
-        "padding:5px 12px;border-radius:20px;text-transform:uppercase;'>v1.2 · 10 columns</span>"
-        "</div></div>"
+        f"font-size:0.58rem;font-family:DM Mono,monospace;letter-spacing:0.1em;"
+        f"padding:4px 12px;border-radius:20px;text-transform:uppercase;'>v1.2 · 10 columns</span>"
+        f"</div></div>"
+        f"<div style='display:grid;grid-template-columns:repeat(3,1fr);gap:10px;'>"
+        f"<div style='background:{SURFACE2};border:1px solid {BORDER};border-radius:10px;padding:12px 16px;'>"
+        f"<div style='font-size:0.55rem;font-family:DM Mono,monospace;letter-spacing:0.14em;text-transform:uppercase;color:{TEAL};margin-bottom:4px;'>Environment</div>"
+        f"<div style='font-size:0.8rem;color:{TEXT};font-weight:600;'>Sequential Decision Making</div>"
+        f"<div style='font-size:0.62rem;color:{SUBTEXT};margin-top:3px;font-family:DM Mono,monospace;'>One dirty row inspected per step</div>"
+        f"</div>"
+        f"<div style='background:{SURFACE2};border:1px solid {BORDER};border-radius:10px;padding:12px 16px;'>"
+        f"<div style='font-size:0.55rem;font-family:DM Mono,monospace;letter-spacing:0.14em;text-transform:uppercase;color:{TEAL};margin-bottom:4px;'>Actions</div>"
+        f"<div style='font-size:0.8rem;color:{TEXT};font-weight:600;'>skip &nbsp;&middot;&nbsp; impute &nbsp;&middot;&nbsp; fix_outlier</div>"
+        f"<div style='font-size:0.62rem;color:{SUBTEXT};margin-top:3px;font-family:DM Mono,monospace;'>7 issue types across 10 columns</div>"
+        f"</div>"
+        f"<div style='background:{SURFACE2};border:1px solid {BORDER};border-radius:10px;padding:12px 16px;'>"
+        f"<div style='font-size:0.55rem;font-family:DM Mono,monospace;letter-spacing:0.14em;text-transform:uppercase;color:{TEAL};margin-bottom:4px;'>Reward</div>"
+        f"<div style='font-size:0.8rem;color:{TEXT};font-weight:600;'>+2 correct &nbsp;&middot;&nbsp; &minus;1 wrong &nbsp;&middot;&nbsp; +5 bonus</div>"
+        f"<div style='font-size:0.62rem;color:{SUBTEXT};margin-top:3px;font-family:DM Mono,monospace;'>Dense signal at every step</div>"
+        f"</div>"
+        f"</div>"
+        f"</div>"
     )
 
     # Hidden textboxes — bridge JS ↔ Gradio Python
