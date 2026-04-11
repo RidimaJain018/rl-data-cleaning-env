@@ -28,19 +28,15 @@ class ObservationModel(BaseModel):
     column_stats: Optional[Dict[str, ColumnStats]] = Field(
         None,
         description="Per-column mean and std for numeric columns. "
-                    "Allows the agent to detect z-score outliers without "
-                    "being told the issue type label.",
+                    "Enables z-score reasoning without exposing the issue label.",
     )
     step_progress: Optional[float] = Field(
-        None,
-        ge=0.0,
-        le=1.0,
+        None, ge=0.0, le=1.0,
         description="Fraction of max_steps consumed so far (0.0-1.0).",
     )
     issues_remaining: Optional[int] = Field(
-        None,
-        ge=0,
-        description="Number of data quality issues still unfixed in this episode.",
+        None, ge=0,
+        description="Number of data quality issues still unfixed.",
     )
 
     @field_validator("row_data")
@@ -53,13 +49,7 @@ class ObservationModel(BaseModel):
     class Config:
         json_schema_extra = {
             "example": {
-                "row_data": {
-                    "age": None,
-                    "salary": 50000,
-                    "city": "NY",
-                    "experience": 2,
-                    "rating": 4.5,
-                },
+                "row_data": {"age": None, "salary": 50000, "city": "NY"},
                 "column_stats": {
                     "salary": {"mean": 87000.0, "std": 22000.0},
                     "age":    {"mean": 38.5,    "std": 9.2},
@@ -81,6 +71,7 @@ class ObservationModel(BaseModel):
 VALID_ACTIONS: Dict[int, str] = {
     0: "skip",
     1: "impute_missing",
+    2: "flag_for_review",
     3: "fix_outlier",
 }
 
@@ -215,7 +206,7 @@ class EpisodeLogEntryModel(BaseModel):
                 "row": 0,
                 "col": "age",
                 "issue": "missing",
-                "action": "impute_missing",
+                "action": "flag_for_review",
                 "correct": True,
                 "old_value": "nan",
                 "new_value": "28.5",

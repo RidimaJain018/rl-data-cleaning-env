@@ -24,6 +24,7 @@ Or via start.sh (production — runs FastAPI + Gradio together):
 from __future__ import annotations
 
 import io
+import os
 from typing import Optional
 
 import numpy as np
@@ -102,7 +103,6 @@ def _sanitise_obs(obs: dict | None) -> dict | None:
 def _obs_model(obs: dict | None) -> Optional[ObservationModel]:
     if obs is None:
         return None
-    # Sanitise NaN in row_data
     clean_row = {
         k: (None if (isinstance(v, float) and np.isnan(v)) else v)
         for k, v in obs["row_data"].items()
@@ -301,6 +301,111 @@ async def upload(
         "total_issues":  env.total_issues_at_start,
         "rows":          len(df),
         "columns":       list(df.columns),
+    }
+
+
+
+# ---------------------------------------------------------------------------
+# POST /evaluate_upload  — upload CSV, run full episode with trained Q-agent,
+#                          return score. Closes the "CSV not in eval loop" gap.
+# ---------------------------------------------------------------------------
+@app.post("/evaluate_upload")
+async def evaluate_upload(
+    file: UploadFile = File(...),
+    x_session_id: Optional[str] = Header(default=None),
+):
+    """
+    Upload any CSV and run a full cleaning episode using the trained Q-policy
+    (falls back to baseline_agent if policy.pkl is not present).
+
+    Returns: score, steps taken, issues found, and the full episode log.
+    This endpoint closes the loop between CSV upload and RL evaluation —
+    the trained agent is evaluated on unseen data, not just the 3 fixed tasks.
+    """
+    if not file.filename.endswith(".csv"):
+        raise HTTPException(status_code=422, detail="Only CSV files are supported.")
+
+    try:
+        contents = await file.read()
+        df = pd.read_csv(io.BytesIO(contents))
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Could not parse CSV: {exc}")
+
+    if df.empty:
+        raise HTTPException(status_code=422, detail="Uploaded CSV is empty.")
+
+    sid = _session_id(x_session_id)
+    env = _get_env(sid)
+
+    try:
+        obs = env.reset_from_dataframe(df)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    # Load trained Q-policy if available, else use baseline
+    agent_fn   = baseline_agent
+    agent_name = "baseline"
+    policy_path = os.path.join(os.path.dirname(__file__), "policy.pkl")
+    if os.path.exists(policy_path):
+        try:
+            import pickle, math
+            from env import EXPECTED_NUMERIC as _ENC
+            with open(policy_path, "rb") as _f:
+                _artifact = pickle.load(_f)
+            _policy = _artifact["policy"]
+
+            def _parseable(s):
+                try: float(s); return True
+                except: return False
+
+            def _q_agent(observation):
+                if observation is None:
+                    return 0
+                row = observation["row_data"]
+                nv = {k: float(v) for k, v in row.items()
+                      if k in _ENC and isinstance(v, (int, float))
+                      and not (isinstance(v, float) and math.isnan(v))}
+                if nv:
+                    vals = list(nv.values())
+                    mean = sum(vals) / len(vals)
+                    std  = (sum((x-mean)**2 for x in vals)/len(vals))**0.5 or 1.0
+                else:
+                    mean, std = 0.0, 1.0
+                features = []
+                for col in sorted(row.keys()):
+                    val = row[col]
+                    is_null = val is None or (isinstance(val, float) and math.isnan(val))
+                    is_str  = col in _ENC and isinstance(val, str) and not _parseable(val)
+                    has_ws  = isinstance(val, str) and val != val.strip()
+                    if col in _ENC and isinstance(val, (int, float)) and not is_null:
+                        z = (float(val) - mean) / std
+                        bucket = -2 if z < -2 else (-1 if z < -0.5 else (0 if z <= 0.5 else (1 if z <= 2 else 2)))
+                    else:
+                        bucket = 0
+                    features.append((col, int(is_null), int(is_str), int(has_ws), bucket))
+                state = tuple(features)
+                return _policy.get(state, upload_agent(observation))
+
+            agent_fn   = _q_agent
+            agent_name = f"Q-policy({len(_policy)}_states)"
+        except Exception as _e:
+            pass  # fall through to baseline
+
+    done = False
+    while not done:
+        action = agent_fn(obs)
+        obs, _, done, _ = env.step(action)
+
+    raw = env.state()
+    return {
+        "agent":           agent_name,
+        "score":           raw["score"],
+        "steps":           raw["current_step"],
+        "total_issues":    raw["total_issues_at_start"],
+        "remaining":       raw["remaining_issues"],
+        "rows":            len(df),
+        "columns":         list(df.columns),
+        "episode_log":     raw["episode_log"],
     }
 
 
