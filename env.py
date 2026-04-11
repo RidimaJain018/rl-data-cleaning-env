@@ -368,9 +368,23 @@ class DataCleaningEnv:
                         self.issues.append((idx, col, "outlier")); break
 
     # -----------------------------------------------------------------------
-    # OBSERVATION
+    # OBSERVATION — Partially Observable
     # -----------------------------------------------------------------------
     def get_observation(self) -> dict | None:
+        """
+        Returns the current observation WITHOUT revealing the issue type label.
+        The agent must infer what is wrong purely from:
+            - row_data        : raw cell values (may contain None, strings, outliers)
+            - column_stats    : per-column mean and std so the agent can detect
+                                z-score outliers without being told they are outliers
+            - step_progress   : fraction of episode steps used (0.0–1.0)
+            - issues_remaining: how many issues are still unfixed
+
+        What is deliberately NOT included:
+            - issue_type  (e.g. "outlier", "missing") — agent must learn this
+            - correct_action  — agent must learn this from reward signal
+            - col            — agent must scan the full row itself
+        """
         if not self.issues:
             return None
         if self.current_idx >= len(self.issues):
@@ -379,7 +393,25 @@ class DataCleaningEnv:
         if row_idx not in self.df.index:          # guard after duplicate drop
             self.current_idx = 0
             row_idx, _, _ = self.issues[0]
-        return {"row_data": self.df.loc[row_idx].to_dict()}
+
+        row_dict = self.df.loc[row_idx].to_dict()
+
+        # Build per-column stats (mean ± std) so agent can judge z-scores
+        # without being told whether a value is an "outlier"
+        col_stats: dict = {}
+        for col in self.numeric_cols:
+            s = pd.to_numeric(self.df[col], errors="coerce")
+            m = float(s.mean(skipna=True)) if not pd.isna(s.mean(skipna=True)) else 0.0
+            d = float(s.std(skipna=True))  if not pd.isna(s.std(skipna=True))  else 1.0
+            col_stats[col] = {"mean": round(m, 2), "std": round(max(d, 0.01), 2)}
+
+        max_s = max(self.max_steps, 1)
+        return {
+            "row_data":         row_dict,
+            "column_stats":     col_stats,
+            "step_progress":    round(self.steps / max_s, 4),
+            "issues_remaining": len(self.issues),
+        }
 
     # -----------------------------------------------------------------------
     # STEP

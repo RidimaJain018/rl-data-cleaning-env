@@ -100,10 +100,19 @@ def _sanitise_obs(obs: dict | None) -> dict | None:
 
 
 def _obs_model(obs: dict | None) -> Optional[ObservationModel]:
-    sanitised = _sanitise_obs(obs)
-    if sanitised is None:
+    if obs is None:
         return None
-    return ObservationModel(**sanitised)
+    # Sanitise NaN in row_data
+    clean_row = {
+        k: (None if (isinstance(v, float) and np.isnan(v)) else v)
+        for k, v in obs["row_data"].items()
+    }
+    return ObservationModel(
+        row_data=clean_row,
+        column_stats=obs.get("column_stats"),
+        step_progress=obs.get("step_progress"),
+        issues_remaining=obs.get("issues_remaining"),
+    )
 
 
 # ---------------------------------------------------------------------------

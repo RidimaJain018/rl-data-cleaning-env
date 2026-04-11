@@ -1,8 +1,10 @@
 """
-inference.py — Run DataCleaningEnv episodes locally with LLM agent
-===================================================================
-Runs the environment by importing env.py directly — works inside the
-hackathon checker's Docker container and locally.
+inference.py — Run DataCleaningEnv episodes with trained Q-policy + LLM agent
+===============================================================================
+Agent priority (automatic, no flags needed):
+    1. Trained Q-policy  (policy.pkl)  — loaded if file exists
+    2. LLM agent         (API call)    — used if API_BASE_URL + API_KEY set
+    3. Baseline rule-based agent       — deterministic fallback, never crashes
 
 STDOUT FORMAT (required by hackathon checker):
     [START] task=<task_name> env=<benchmark> model=<model_name>
@@ -15,9 +17,10 @@ from __future__ import annotations
 import json
 import math
 import os
+import pickle
 import re
 import sys
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Force stdout unbuffered — required so checker sees output immediately
@@ -28,12 +31,12 @@ except Exception:
     pass
 
 # ---------------------------------------------------------------------------
-# Environment variables
-# Checker injects API_KEY and API_BASE_URL — we read both
+# Environment variables (checker injects API_KEY and API_BASE_URL)
 # ---------------------------------------------------------------------------
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME   = os.getenv("MODEL_NAME", "meta-llama/Llama-3.2-3B-Instruct")
 HF_TOKEN     = os.getenv("API_KEY") or os.getenv("HF_TOKEN", "")
+POLICY_PATH  = os.getenv("POLICY_PATH", "policy.pkl")
 
 BENCHMARK               = "data-cleaning-env"
 SUCCESS_SCORE_THRESHOLD = 0.5
@@ -41,7 +44,7 @@ SUCCESS_SCORE_THRESHOLD = 0.5
 # ---------------------------------------------------------------------------
 # Import local environment directly (all files are in /app in Docker)
 # ---------------------------------------------------------------------------
-from env import DataCleaningEnv
+from env import DataCleaningEnv, EXPECTED_NUMERIC
 
 # ---------------------------------------------------------------------------
 # Structured stdout loggers — exact format the checker parses
@@ -61,7 +64,7 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
     print(f"[END] success={str(success).lower()} steps={steps} score={score:.2f} rewards={rewards_str}", flush=True)
 
 # ---------------------------------------------------------------------------
-# NaN-safe helper — pandas returns float('nan') for missing, not None
+# NaN-safe helper
 # ---------------------------------------------------------------------------
 def _is_missing(val) -> bool:
     if val is None:
@@ -71,76 +74,142 @@ def _is_missing(val) -> bool:
     return False
 
 # ---------------------------------------------------------------------------
-# Baseline agent — fallback only, used when LLM call fails
+# Feature extraction for Q-policy (must match train.py exactly)
 # ---------------------------------------------------------------------------
-EXPECTED_NUMERIC   = {"age", "salary", "experience", "rating", "bonus",
-                      "years_at_company", "performance_score", "overtime_hours"}
-OUTLIER_THRESHOLDS = {"salary": 300_000, "bonus": 80_000}
-SCORE_COLS         = {"rating", "performance_score"}
+def _parseable_as_float(s: str) -> bool:
+    try:
+        float(s)
+        return True
+    except (ValueError, TypeError):
+        return False
 
 
-def _baseline_agent(observation) -> int:
-    """Rule-based fallback agent. Returns 0=skip, 1=impute_missing, 3=fix_outlier."""
-    if observation is None:
-        return 0
+def _obs_to_state_key(obs) -> Tuple:
+    """Convert raw observation to the same state key used during training."""
+    if obs is None:
+        return ("__terminal__",)
 
-    if isinstance(observation, dict):
-        row_data = observation["row_data"]
+    if isinstance(obs, dict):
+        row = obs["row_data"]
     else:
-        row_data = observation.row_data
+        row = obs.row_data
 
-    # type mismatch: non-parseable string in a numeric column
-    for key, val in row_data.items():
-        if key in EXPECTED_NUMERIC and isinstance(val, str):
-            try:
-                float(val)
-            except (ValueError, TypeError):
-                return 3
+    numeric_vals = {
+        k: float(v) for k, v in row.items()
+        if k in EXPECTED_NUMERIC
+        and isinstance(v, (int, float))
+        and not (isinstance(v, float) and math.isnan(float(v)))
+    }
 
-    # whitespace padding
-    for val in row_data.values():
-        if isinstance(val, str) and val != val.strip():
-            return 3
+    if numeric_vals:
+        vals = list(numeric_vals.values())
+        mean = sum(vals) / len(vals)
+        std  = (sum((x - mean) ** 2 for x in vals) / len(vals)) ** 0.5 or 1.0
+    else:
+        mean, std = 0.0, 1.0
 
-    # column-specific outlier thresholds
-    for key, val in row_data.items():
-        if key in OUTLIER_THRESHOLDS and isinstance(val, (int, float)) and not _is_missing(val):
-            if val > OUTLIER_THRESHOLDS[key]:
-                return 3
+    features = []
+    for col in sorted(row.keys()):
+        val = row[col]
 
-    # invalid score range (> 5)
-    for key, val in row_data.items():
-        if key in SCORE_COLS and isinstance(val, (int, float)) and not _is_missing(val):
-            if val > 5:
-                return 3
+        is_null = val is None or (isinstance(val, float) and math.isnan(float(val)))
 
-    # invalid negative in numeric column
-    for key, val in row_data.items():
-        if key in EXPECTED_NUMERIC and isinstance(val, (int, float)) and not _is_missing(val):
-            if val < 0:
-                return 3
+        is_str_in_numeric = (
+            col in EXPECTED_NUMERIC
+            and isinstance(val, str)
+            and not _parseable_as_float(val)
+        )
 
-    # missing value (None OR float NaN from pandas)
-    for val in row_data.values():
-        if _is_missing(val):
-            return 1
+        has_whitespace = isinstance(val, str) and val != val.strip()
 
-    return 0
+        if col in EXPECTED_NUMERIC and isinstance(val, (int, float)) and not is_null:
+            z = (float(val) - mean) / std
+            if z < -2:
+                bucket = -2
+            elif z < -0.5:
+                bucket = -1
+            elif z <= 0.5:
+                bucket = 0
+            elif z <= 2:
+                bucket = 1
+            else:
+                bucket = 2
+        else:
+            bucket = 0
+
+        features.append((col, int(is_null), int(is_str_in_numeric),
+                         int(has_whitespace), bucket))
+
+    return tuple(features)
 
 
 # ---------------------------------------------------------------------------
-# LLM agent — always called; falls back to baseline only on API error
+# Agent 1 — Trained Q-policy
 # ---------------------------------------------------------------------------
-def _llm_agent(observation) -> int:
+_loaded_policy: Optional[Dict[Tuple, int]] = None
+_policy_load_attempted = False
+
+
+def _load_policy() -> Optional[Dict[Tuple, int]]:
+    global _loaded_policy, _policy_load_attempted
+    if _policy_load_attempted:
+        return _loaded_policy
+    _policy_load_attempted = True
+    if not os.path.exists(POLICY_PATH):
+        print(f"[DEBUG] policy.pkl not found at {POLICY_PATH} — skipping Q-agent", file=sys.stderr, flush=True)
+        return None
+    try:
+        with open(POLICY_PATH, "rb") as f:
+            artifact = pickle.load(f)
+        _loaded_policy = artifact["policy"]
+        eps = artifact.get("episodes_trained", "?")
+        print(f"[DEBUG] Loaded Q-policy ({len(_loaded_policy)} states, trained {eps} eps)", file=sys.stderr, flush=True)
+        return _loaded_policy
+    except Exception as exc:
+        print(f"[DEBUG] Failed to load policy.pkl: {exc}", file=sys.stderr, flush=True)
+        return None
+
+
+def _q_policy_agent(obs) -> Optional[int]:
+    """Return action from trained Q-policy, or None if policy unavailable."""
+    policy = _load_policy()
+    if policy is None:
+        return None
+    state  = _obs_to_state_key(obs)
+    action = policy.get(state)
+    if action is None:
+        # Unseen state — fall through to LLM/baseline
+        print(f"[DEBUG] Q-policy: unseen state, falling through", file=sys.stderr, flush=True)
+        return None
+    return action
+
+
+# ---------------------------------------------------------------------------
+# Agent 2 — LLM agent (OpenAI-compatible, proxied through checker)
+# ---------------------------------------------------------------------------
+EXPECTED_NUMERIC_RANGES = {
+    "age": (22, 62),
+    "salary": (35000, 180000),
+    "experience": (0, 30),
+    "rating": (0.0, 5.0),
+    "bonus": (0, 25000),
+    "years_at_company": (0, 20),
+    "performance_score": (0.0, 5.0),
+    "overtime_hours": (0, 80),
+}
+
+
+def _llm_agent(obs) -> int:
     try:
         from openai import OpenAI
         client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
 
-        if isinstance(observation, dict):
-            row_data = observation["row_data"]
+        if isinstance(obs, dict):
+            row_data = obs["row_data"]
         else:
-            row_data = observation.row_data
+            row_data = obs.row_data
 
+        # Build row display — raw values only, no hints about issue type
         row_lines = []
         for col, val in row_data.items():
             if _is_missing(val):
@@ -180,8 +249,80 @@ def _llm_agent(observation) -> int:
         return action if action in {0, 1, 3} else 0
 
     except Exception as exc:
-        print(f"[DEBUG] LLM call failed, using baseline: {exc}", file=sys.stderr, flush=True)
-        return _baseline_agent(observation)
+        print(f"[DEBUG] LLM call failed: {exc}", file=sys.stderr, flush=True)
+        return _baseline_agent(obs)
+
+
+# ---------------------------------------------------------------------------
+# Agent 3 — Rule-based baseline (deterministic fallback, never crashes)
+# ---------------------------------------------------------------------------
+OUTLIER_THRESHOLDS = {"salary": 300_000, "bonus": 80_000}
+SCORE_COLS         = {"rating", "performance_score"}
+
+
+def _baseline_agent(obs) -> int:
+    if obs is None:
+        return 0
+
+    if isinstance(obs, dict):
+        row_data = obs["row_data"]
+    else:
+        row_data = obs.row_data
+
+    # type mismatch: non-parseable string in numeric column
+    for key, val in row_data.items():
+        if key in EXPECTED_NUMERIC and isinstance(val, str):
+            try:
+                float(val)
+            except (ValueError, TypeError):
+                return 3
+
+    # whitespace padding
+    for val in row_data.values():
+        if isinstance(val, str) and val != val.strip():
+            return 3
+
+    # column-specific outlier thresholds
+    for key, val in row_data.items():
+        if key in OUTLIER_THRESHOLDS and isinstance(val, (int, float)) and not _is_missing(val):
+            if val > OUTLIER_THRESHOLDS[key]:
+                return 3
+
+    # invalid score range (> 5)
+    for key, val in row_data.items():
+        if key in SCORE_COLS and isinstance(val, (int, float)) and not _is_missing(val):
+            if val > 5:
+                return 3
+
+    # invalid negative
+    for key, val in row_data.items():
+        if key in EXPECTED_NUMERIC and isinstance(val, (int, float)) and not _is_missing(val):
+            if val < 0:
+                return 3
+
+    # missing value
+    for val in row_data.values():
+        if _is_missing(val):
+            return 1
+
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Master agent — Q-policy → LLM → baseline (in that order)
+# ---------------------------------------------------------------------------
+def _select_action(obs) -> int:
+    # 1. Try trained Q-policy first
+    q_action = _q_policy_agent(obs)
+    if q_action is not None:
+        return q_action
+
+    # 2. Try LLM (checker requires API calls through proxy when available)
+    if HF_TOKEN:
+        return _llm_agent(obs)
+
+    # 3. Deterministic baseline fallback
+    return _baseline_agent(obs)
 
 
 # ---------------------------------------------------------------------------
@@ -209,8 +350,7 @@ def run_episode(task_level: str, agent_name: str) -> dict:
         while not done:
             steps_taken += 1
 
-            # Always use LLM agent — checker requires API calls through proxy
-            action_id    = _llm_agent(obs)
+            action_id    = _select_action(obs)
             action_label = VALID_ACTIONS.get(action_id, str(action_id))
 
             obs, reward, done, _info = env.step(action_id)
@@ -221,7 +361,7 @@ def run_episode(task_level: str, agent_name: str) -> dict:
 
         raw_state = env.state()
         score     = round(float(raw_state.get("score", 0.01)), 4)
-        # Clamp to open interval (0, 1) — checker rejects exactly 0.0 or 1.0
+        # NOTE: score clamping kept as-is — checker rejects exactly 0.0 or 1.0
         score     = min(max(score, 0.01), 0.99)
         success   = score >= SUCCESS_SCORE_THRESHOLD
 
@@ -235,12 +375,23 @@ def run_episode(task_level: str, agent_name: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Main — always runs all 3 levels with LLM agent
+# Main — runs all 3 levels
 # ---------------------------------------------------------------------------
 def main():
+    # Determine which agent is active and log it
+    policy = _load_policy()
+    if policy is not None:
+        active = f"Q-policy({len(policy)}_states)"
+    elif HF_TOKEN:
+        active = f"LLM({MODEL_NAME})"
+    else:
+        active = "baseline"
+
+    print(f"[DEBUG] Active agent: {active}", file=sys.stderr, flush=True)
+
     levels = ("easy", "medium", "hard")
     for lvl in levels:
-        run_episode(lvl, agent_name=MODEL_NAME)
+        run_episode(lvl, agent_name=active)
 
 
 if __name__ == "__main__":

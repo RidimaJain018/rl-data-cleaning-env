@@ -13,11 +13,34 @@ CellValue = Optional[Union[float, int, str]]
 # ---------------------------------------------------------------------------
 # Observation
 # ---------------------------------------------------------------------------
+class ColumnStats(BaseModel):
+    mean: float = Field(..., description="Column mean (computed on clean values)")
+    std:  float = Field(..., description="Column standard deviation")
+
+
 class ObservationModel(BaseModel):
     row_data: Dict[str, CellValue] = Field(
         ...,
-        description="Key-value pairs for a single row being inspected. "
-                    "Values may be None if the cell is missing.",
+        description="Raw cell values for the row being inspected. "
+                    "The issue type is NOT revealed — the agent must infer it "
+                    "from raw values and column_stats.",
+    )
+    column_stats: Optional[Dict[str, ColumnStats]] = Field(
+        None,
+        description="Per-column mean and std for numeric columns. "
+                    "Allows the agent to detect z-score outliers without "
+                    "being told the issue type label.",
+    )
+    step_progress: Optional[float] = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Fraction of max_steps consumed so far (0.0-1.0).",
+    )
+    issues_remaining: Optional[int] = Field(
+        None,
+        ge=0,
+        description="Number of data quality issues still unfixed in this episode.",
     )
 
     @field_validator("row_data")
@@ -36,7 +59,13 @@ class ObservationModel(BaseModel):
                     "city": "NY",
                     "experience": 2,
                     "rating": 4.5,
-                }
+                },
+                "column_stats": {
+                    "salary": {"mean": 87000.0, "std": 22000.0},
+                    "age":    {"mean": 38.5,    "std": 9.2},
+                },
+                "step_progress":    0.1,
+                "issues_remaining": 5,
             }
         }
 
