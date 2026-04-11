@@ -1,24 +1,24 @@
 # OpenEnv Environment Specification
 # ===================================
-# RL Data Cleaning Agent — v1.2.0
-# Ten-column employee dataset across three difficulty levels.
-# 7 issue types: missing · outlier · invalid_rating · invalid_negative
+# RL Data Cleaning Agent — v2.0.0
+# Multi-domain tabular data cleaning across HR, Finance, Medical, Ecommerce.
+# 7 issue types: missing · outlier · invalid_negative · invalid_range
 #                duplicate · type_mismatch · whitespace_padding
 
 name: rl-data-cleaning-env
 description: >
-  A reinforcement-learning environment for tabular data cleaning.
-  The agent inspects one problematic data row per step and chooses an action
-  (skip / impute_missing / fix_outlier) to iteratively clean a dirty DataFrame.
-  Three difficulty levels expose progressively harder data quality challenges:
-  missing values, salary/bonus outliers, invalid negatives, invalid rating scores,
-  duplicate rows, type mismatches, and whitespace padding — across a 10-column
-  employee dataset (age, salary, city, experience, rating, department, bonus,
-  years_at_company, performance_score, overtime_hours).
-version: "1.2.0"
+  A reinforcement-learning environment for tabular data cleaning across four
+  real-world domains: HR employee records, financial transactions, medical
+  patient records, and ecommerce orders. The agent inspects one problematic
+  row per step and chooses an action (skip / impute_missing / flag_for_review /
+  fix_outlier) to iteratively clean a dirty DataFrame. Three difficulty levels
+  control which domains are active and how many issue types appear — the agent
+  must generalise across schemas without being told which domain it is operating on.
+version: "2.0.0"
 tags:
   - data-cleaning
   - tabular
+  - multi-domain
   - openenv-hackathon
   - reinforcement-learning
 
@@ -27,7 +27,7 @@ tags:
 # ---------------------------------------------------------------------------
 server:
   module: app
-  app: app        # FIX: was "main" — the FastAPI instance in app.py is named "app"
+  app: main
   host: "0.0.0.0"
   port: 8000
 
@@ -61,7 +61,8 @@ endpoints:
     path: /reset
     description: >
       Start a new episode for the given task level.
-      Returns the first observation (row with data issues) or null if clean.
+      Samples a domain (HR / Finance / Medical / Ecommerce) based on difficulty,
+      generates a dirty DataFrame, and returns the first observation.
     request:
       content_type: application/json
       schema:
@@ -102,7 +103,8 @@ endpoints:
     path: /state
     description: >
       Return a full snapshot of the current episode state without advancing it.
-      Includes task level, step counts, score, remaining issues, and episode log.
+      Includes task level, active domain, step counts, score, remaining issues,
+      and full episode log.
     response:
       content_type: application/json
       schema:
@@ -114,7 +116,7 @@ endpoints:
     description: >
       Run a complete episode from start to finish using the baseline agent
       and return the final EnvStateModel. Useful for smoke tests and automated
-      evaluation pipelines (no step-by-step loop needed).
+      evaluation pipelines.
     request:
       content_type: application/json
       schema:
@@ -139,7 +141,7 @@ endpoints:
     description: >
       Upload any CSV file to start a cleaning episode.
       Auto-detects numeric vs categorical columns and applies IQR-based outlier
-      detection — works with any column names and row counts.
+      detection — works with any column names, any domain, any row count.
     request:
       content_type: multipart/form-data
       body:
@@ -161,6 +163,20 @@ endpoints:
             type: array
             items:
               type: string
+
+  evaluate_upload:
+    method: POST
+    path: /evaluate_upload
+    description: >
+      Upload any CSV and run a full cleaning episode with the trained Q-policy
+      (falls back to baseline if policy.pkl not present). Returns score, steps,
+      and full episode log. Evaluates the trained agent on genuinely unseen data.
+    request:
+      content_type: multipart/form-data
+      body:
+        file: CSV file (binary upload)
+    response:
+      content_type: application/json
 
   health:
     method: GET
@@ -186,10 +202,7 @@ models:
 # ---------------------------------------------------------------------------
 action_space:
   type: discrete
-  n: 3
-  note: >
-    Action IDs are 0, 1, and 3. ID 2 is intentionally reserved for a future
-    flag_for_review action and is not valid in this version.
+  n: 4
   actions:
     - id: 0
       label: skip
@@ -202,136 +215,122 @@ action_space:
         Fill a NaN / missing (null) cell with the column mean (numeric columns)
         or the column mode (categorical columns).
         Correct for issue type: missing.
+    - id: 2
+      label: flag_for_review
+      description: >
+        Mark the row as suspicious without fixing it. Gives a small negative
+        reward (-0.5) — better than a wrong fix (-1) but worse than correct fix (+2).
+        Useful for genuinely ambiguous rows. Does not advance the fix count.
     - id: 3
       label: fix_outlier
       description: >
         Replace an invalid, corrupt, or out-of-range value with the column mean.
         Also handles: duplicate rows (drops the row), type mismatches (coerces
         to numeric then imputes), and whitespace padding (strips the string).
-        Correct for issue types: outlier, invalid_negative, invalid_rating,
+        Correct for issue types: outlier, invalid_negative, invalid_range,
         duplicate, type_mismatch, whitespace_padding.
 
 # ---------------------------------------------------------------------------
-# Observation space  (10-column employee dataset)
+# Observation space  (multi-domain — fields vary by active domain)
 # ---------------------------------------------------------------------------
 observation_space:
   type: dict
   description: >
-    A single row from the dirty 10-column employee DataFrame, presented as
-    key-value pairs. Missing cells appear as null. Outlier / invalid cells
-    retain their raw values. A type_mismatch row may contain a non-parseable
-    string (e.g. "N/A", "ten") in a numeric column. A whitespace_padding row
-    may contain a string with leading/trailing spaces.
-  fields:
-    age:
-      type: "number | string | null"
-      nullable: true
-      description: "Age in years (22–62). Issues: null (missing), negative (invalid_negative), non-parseable string e.g. 'N/A' (type_mismatch)."
-    salary:
-      type: "number | null"
-      nullable: false
-      description: "Annual salary in USD (35k–180k). Issues: > 300,000 (outlier)."
-    city:
-      type: "string | null"
-      nullable: true
-      description: "City name (one of 8 US cities). Issues: null (missing), leading/trailing spaces e.g. ' NY ' (whitespace_padding)."
-    experience:
-      type: "number | null"
-      nullable: true
-      description: "Years of professional experience (0–30). Issues: null (missing), negative (invalid_negative)."
-    rating:
-      type: "number | null"
-      nullable: true
-      description: "Performance rating 0–5 (valid range 2.5–4.9). Issues: null (missing), > 5 (invalid_rating)."
-    department:
-      type: "string | null"
-      nullable: true
-      description: "Department name (one of 6 departments). Issues: null (missing), leading/trailing spaces (whitespace_padding)."
-    bonus:
-      type: "number | null"
-      nullable: true
-      description: "Annual bonus in USD (0–25k). Issues: null (missing), > 80,000 (outlier)."
-    years_at_company:
-      type: "number | string | null"
-      nullable: true
-      description: "Years at current employer (0–20). Issues: null (missing), negative (invalid_negative), non-parseable string e.g. 'ten' (type_mismatch)."
-    performance_score:
-      type: "number | null"
-      nullable: true
-      description: "Performance score 0–5 (valid range 2.5–4.9). Issues: null (missing), > 5 (invalid_rating)."
-    overtime_hours:
-      type: "number | null"
-      nullable: true
-      description: "Monthly overtime hours (0–80). Issues: null (missing), negative (invalid_negative)."
+    A single dirty row from the active domain's DataFrame, presented as raw
+    key-value pairs. The domain name and issue type label are NEVER included.
+    The agent must infer what is wrong from:
+      row_data      — raw cell values (may contain None, strings, numeric outliers)
+      column_stats  — per-column mean and std, enabling z-score reasoning
+      step_progress — fraction of max_steps consumed (0.0–1.0)
+      issues_remaining — how many issues are still unfixed
+  domains:
+    hr:
+      columns: [employee_id, age, salary, department, job_title, city,
+                experience, years_at_company, performance_score, bonus,
+                overtime_hours, rating]
+      numeric: [age, salary, experience, years_at_company, performance_score,
+                bonus, overtime_hours, rating]
+    finance:
+      columns: [transaction_id, account_id, amount, balance, credit_limit,
+                transaction_fee, merchant, category, status, country]
+      numeric: [amount, balance, credit_limit, transaction_fee]
+    medical:
+      columns: [patient_id, age_years, systolic_bp, diastolic_bp, heart_rate,
+                glucose_level, bmi, dosage_mg, lab_value, diagnosis,
+                medication, blood_type]
+      numeric: [age_years, systolic_bp, diastolic_bp, heart_rate,
+                glucose_level, bmi, dosage_mg, lab_value]
+    ecommerce:
+      columns: [order_id, sku, price, quantity, discount_pct, shipping_days,
+                review_score, return_rate, units_sold, category, carrier, status]
+      numeric: [price, quantity, discount_pct, shipping_days, review_score,
+                return_rate, units_sold]
 
 # ---------------------------------------------------------------------------
-# Issue types (all possible values of EpisodeLogEntryModel.issue)
+# Issue types
 # ---------------------------------------------------------------------------
 issue_types:
   - id: missing
     description: "A cell contains NaN or null. Correct action: 1 (impute_missing)."
   - id: outlier
-    description: "salary > 300,000 or bonus > 80,000. Correct action: 3 (fix_outlier)."
-  - id: invalid_rating
-    description: "rating or performance_score > 5. Correct action: 3 (fix_outlier)."
+    description: "Numeric value far outside the column distribution (IQR-based). Correct action: 3 (fix_outlier)."
   - id: invalid_negative
-    description: "A numeric column contains a negative value (overtime_hours, years_at_company, experience, age). Correct action: 3 (fix_outlier)."
+    description: "A negative value in a column whose valid range is non-negative. Correct action: 3 (fix_outlier)."
+  - id: invalid_range
+    description: "A value that violates the domain-specific valid range (e.g. discount > 100%, review > 5.0). Correct action: 3 (fix_outlier)."
   - id: duplicate
-    description: "An exact duplicate of a previously seen row. Correct action: 3 (fix_outlier — drops the row)."
+    description: "An exact duplicate of a previously seen row (row is dropped). Correct action: 3 (fix_outlier)."
   - id: type_mismatch
-    description: "A non-parseable string (e.g. 'N/A', 'ten') in an expected-numeric column (age, years_at_company). Correct action: 3 (fix_outlier — coerces and imputes)."
+    description: "A non-parseable string in an expected-numeric column (e.g. 'N/A', 'unknown'). Correct action: 3 (fix_outlier)."
   - id: whitespace_padding
-    description: "A string column value has leading or trailing whitespace (city, department). Correct action: 3 (fix_outlier — strips the string)."
+    description: "A string column value has leading or trailing whitespace. Correct action: 3 (fix_outlier)."
 
 # ---------------------------------------------------------------------------
-# Task descriptions  (row/issue counts match env.py load_task_data exactly)
+# Task descriptions
 # ---------------------------------------------------------------------------
 tasks:
   easy:
-    rows: 20
-    issues: 8
-    issue_types_present: [missing]
-    description: >
-      20-row dataset with exactly 8 missing (NaN) cells spread across 8 different
-      columns: age, city, experience, rating, department, bonus, years_at_company,
-      performance_score. Every correct action is impute_missing (1).
-      Seed: 42.
-
-  medium:
-    rows: 30
+    rows: 40
     issues: 12
-    issue_types_present: [missing, outlier, invalid_rating, invalid_negative, whitespace_padding]
+    domains_active: [hr]
+    issue_types_present: [missing, outlier, invalid_negative]
     description: >
-      30-row dataset with 12 issues:
-        5 missing values (age, city, experience, department, overtime_hours),
-        3 outliers (2 salary outliers 320k–2M, 1 bonus outlier 90k–250k),
-        2 invalid rating scores (performance_score and rating both > 5),
-        1 invalid negative (overtime_hours < 0),
-        1 whitespace-padded city string.
-      Agent must distinguish impute_missing (action 1) from fix_outlier (action 3).
+      40-row HR employee dataset. Single domain — the agent learns the core
+      skip / impute_missing / fix_outlier distinction on familiar employee data
+      (salary, age, bonus, performance_score, etc.) before encountering new domains.
       Seed: 123.
 
-  hard:
-    rows: 50
+  medium:
+    rows: 80
     issues: 20
+    domains_active: [hr, finance]
+    issue_types_present: [missing, outlier, invalid_negative, type_mismatch, whitespace_padding]
+    description: >
+      80-row mixed dataset drawn from HR and Finance domains. The agent must
+      generalise its cleaning policy to financial transaction records
+      (amount, balance, credit_limit, transaction_fee) with different column
+      names and value distributions than HR data. Adds type_mismatch and
+      whitespace_padding issue types. Seed: 999.
+
+  hard:
+    rows: 120
+    issues: 30
+    domains_active: [hr, finance, medical, ecommerce]
     issue_types_present:
       - missing
       - outlier
       - invalid_negative
+      - invalid_range
       - duplicate
       - type_mismatch
       - whitespace_padding
-      - invalid_rating
     description: >
-      50-row dataset with 20 issues covering all 7 issue types:
-        6 missing values (age, city, experience, rating, department, performance_score),
-        4 outliers (3 salary outliers 400k–4M, 1 bonus outlier 100k–350k),
-        2 invalid negatives (overtime_hours < 0, years_at_company < 0),
-        2 duplicate rows (exact copies of two salary-outlier rows),
-        2 type mismatches (age='N/A', years_at_company='ten'),
-        2 whitespace-padded strings (city, department),
-        2 invalid rating scores (performance_score and rating both > 5).
-      Seed: 999.
+      120-row dataset mixing all four domains. The agent must handle medical
+      patient records (blood pressure, glucose, BMI) and ecommerce orders
+      (price, quantity, discount, review_score) alongside HR and Finance.
+      All 7 issue types are present. The agent cannot rely on column names —
+      it must generalise purely from z-score signals and null/string flags.
+      Seed: 1337.
 
 # ---------------------------------------------------------------------------
 # Reward structure
@@ -339,50 +338,59 @@ tasks:
 reward:
   correct_fix:              +2
   wrong_action:             -1
+  flag_for_review:          -0.5
   episode_completion_bonus: +5
   timeout_penalty:          -5
-  max_steps:                100
   score_formula:            "fixed_issues / total_issues_at_start  →  float in [0.0, 1.0]"
 
   design_rationale: >
-    The reward structure is designed to produce dense, meaningful learning signals
-    at every step — not just terminal rewards.
+    The reward structure produces dense, meaningful learning signals at every
+    step — not just terminal rewards.
 
-    correct_fix (+2): A per-step positive reward for every successful fix ensures
-    the agent gets immediate feedback proportional to its progress. This avoids
-    the sparse-reward problem common in binary pass/fail environments.
+    correct_fix (+2): Per-step positive reward for every successful fix ensures
+    immediate feedback proportional to progress. Avoids the sparse-reward problem.
 
-    wrong_action (-1): A small penalty for incorrect actions (e.g. applying
-    impute_missing to an outlier row) discourages random action selection without
-    making early mistakes catastrophic. The asymmetry (+2 vs -1) means the agent
-    is rewarded more for being right than it is punished for being wrong, which
+    wrong_action (-1): Small penalty for incorrect actions discourages random
+    selection without making early mistakes catastrophic. The +2/-1 asymmetry
     encourages exploration during training.
 
-    episode_completion_bonus (+5): A terminal bonus for resolving all issues
-    rewards the agent for thoroughness — an agent that fixes 19/20 issues scores
-    lower than one that fixes all 20. This creates a clear gradient toward
-    complete dataset cleaning, not just partial improvement.
+    flag_for_review (-0.5): A lighter penalty than wrong_action, encouraging
+    the agent to flag genuinely ambiguous rows rather than guessing wrong.
+    Better than a wrong fix, but the agent is incentivised to actually fix
+    issues it can identify rather than flagging everything.
 
-    timeout_penalty (-5): If the agent exceeds max_steps (100) without cleaning
-    all issues, it receives a penalty. This prevents a degenerate policy of
-    repeatedly cycling through rows without committing to fixes.
+    episode_completion_bonus (+5): Terminal bonus for resolving all issues
+    rewards thoroughness — an agent that fixes 29/30 issues scores meaningfully
+    lower than one that fixes all 30.
 
-    score_formula: The partial-credit score (fixed / total) is reported separately
-    from cumulative reward. This gives a normalised [0.0, 1.0] metric that is
-    comparable across episodes with different numbers of issues, making it
-    suitable for automated grading and cross-level comparison.
+    timeout_penalty (-5): Prevents a degenerate policy of cycling through rows
+    without committing to fixes.
+
+    score_formula: Partial-credit score (fixed/total) is normalised [0.0, 1.0]
+    and comparable across episodes, domains, and difficulty levels.
 
   partial_progress_signals:
     - Per-step reward on every correct fix (not just episode end)
     - Score updates after each correct action (visible via /state)
-    - Episode log records per-step correctness for fine-grained analysis
+    - Episode log records per-step correctness and domain context
     - Remaining issues count decrements after each correct fix
 
 # ---------------------------------------------------------------------------
 # Baseline scores (deterministic — seeded datasets, rule-based agent)
-# Verified: python inference.py --agent baseline
 # ---------------------------------------------------------------------------
 baseline_scores:
-  easy:   { score: 1.000, total_reward: 21, steps: 8,  fixed: "8/8"   }
-  medium: { score: 1.000, total_reward: 29, steps: 12, fixed: "12/12" }
-  hard:   { score: 1.000, total_reward: 45, steps: 20, fixed: "20/20" }
+  easy:   { score: 0.990, steps: 12, fixed: "12/12", domain: "hr" }
+  medium: { score: 0.990, steps: 20, fixed: "20/20", domain: "finance" }
+  hard:   { score: 0.966, steps: 30, fixed: "29/30", domain: "medical" }
+
+# ---------------------------------------------------------------------------
+# Trained Q-policy scores (policy.pkl — 10500 training episodes)
+# ---------------------------------------------------------------------------
+trained_agent_scores:
+  easy:   { avg_score: 0.990, policy_states: 48 }
+  medium: { avg_score: 0.990, policy_states: 48 }
+  hard:   { avg_score: 0.966, policy_states: 48 }
+  note: >
+    Policy is domain-agnostic — state keys are built from (null-flags,
+    z-score buckets, whitespace-flags) per column, not column names.
+    Novel domain states fall through to the LLM/baseline agent.

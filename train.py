@@ -11,12 +11,8 @@ Domains per level:
 The Q-policy is domain-agnostic: it learns from (null-flags, z-score buckets,
 whitespace signals) which are meaningful regardless of column names or domain.
 
-The agent practices very_hard rows (near-boundary salaries, all 7 issue
-types at scale) during training, so the Q-policy covers those state keys
-directly rather than falling back to the rule-based agent.
-
 Q-table is shared across levels — knowledge from easy carries forward into
-very_hard, so the agent builds on what it already learned.
+hard, so the agent builds on what it already learned.
 
 Episode schedule per level:
     easy      → 1.5× base  (single domain, foundation for z-score learning)

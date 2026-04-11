@@ -9,7 +9,7 @@ pinned: false
 
 # RL Data Cleaning Agent
 
-> **Meta × Scaler OpenEnv Hackathon** — OpenEnv-compliant reinforcement-learning environment for tabular data cleaning.
+> **Meta × Scaler OpenEnv Hackathon** — Multi-domain reinforcement-learning environment for tabular data cleaning across HR, Finance, Medical, and Ecommerce datasets.
 
 ---
 
@@ -17,88 +17,79 @@ pinned: false
 
 Real-world datasets are almost never clean. Data scientists spend an estimated **60–80% of their time** handling missing values, outliers, type mismatches, and other quality issues — before any modelling can begin.
 
-This project frames **data cleaning as a sequential decision-making problem**: an RL agent inspects one dirty row at a time and chooses the best remediation action. Three difficulty levels expose progressively harder data quality challenges, from simple missing-value imputation all the way to handling duplicates, type mismatches, and whitespace padding.
+This project frames **data cleaning as a sequential decision-making problem**: an RL agent inspects one dirty row at a time and chooses the best remediation action. Unlike single-schema environments, this environment rotates across **four real-world domains** per episode — the agent must generalise its cleaning policy without ever being told which domain it is operating on.
 
-The environment is fully compliant with the **OpenEnv 3-method interface** (`reset` / `step` / `state`) and is deployable as a Hugging Face Space with a Docker runtime.
+The environment is fully compliant with the **OpenEnv 3-method interface** (`reset` / `step` / `state`) and deploys to Hugging Face Spaces via Docker.
 
-**Key differentiator — CSV Upload:** Beyond the three built-in task levels, the `/upload` endpoint and Gradio UI accept *any* CSV file. The environment auto-detects column types, applies IQR-based outlier detection, and runs a full cleaning episode — all without any prior schema knowledge. This demonstrates the core value of the RL framing: generalisation to unseen data.
+---
 
-The choices involved in data cleaning — *should I impute this missing value or is this an outlier?* — are **sequential and context-dependent**, making RL a natural fit:
+## Four Real-World Domains
 
-- **State**: the current dirty row being inspected
-- **Action**: skip / impute_missing / fix_outlier
-- **Reward**: +2 per correct fix, −1 for wrong actions, +5 completion bonus
-- **Goal**: clean the entire dataset with maximum accuracy and minimum wasted steps
+| Domain | Columns | Example Issues |
+|--------|---------|----------------|
+| **HR** | age, salary, department, experience, performance_score, bonus, overtime_hours... | salary spike to $800k, age=None, overtime=-5 |
+| **Finance** | amount, balance, credit_limit, transaction_fee, merchant, category... | transaction amount of $50,000 on a $200 avg, fee=-$10 |
+| **Medical** | systolic_bp, glucose_level, bmi, dosage_mg, heart_rate, lab_value... | glucose=2400 (coma level), blood pressure=-40, BMI=0.2 |
+| **Ecommerce** | price, quantity, discount_pct, shipping_days, review_score, return_rate... | discount=150%, review=9.0, price=-$5 |
+
+**Difficulty controls which domains are active:**
+- `easy` → HR only (single domain, 40 rows, 12 issues)
+- `medium` → HR + Finance (two domains, 80 rows, 20 issues)
+- `hard` → All four domains (120 rows, 30 issues, all 7 issue types)
+
+The agent sees raw cell values and per-column statistics — **never** the domain name or issue type label. It must learn to map z-score spikes, null signals, and string anomalies to the correct action purely from reward feedback.
 
 ---
 
 ## Why RL over Rule-Based Cleaning?
 
-A deterministic rule-based agent works well on the built-in dataset because the schema is fixed and known in advance. But rule-based agents break the moment the data changes:
-
 | Scenario | Rule-Based Agent | RL Agent |
 |----------|-----------------|----------|
-| Known schema, fixed thresholds | ✅ Works perfectly | ✅ Works |
-| Unknown CSV with new column names | ❌ No rules to apply | ✅ Generalises via observation |
+| Known schema, fixed thresholds | ✅ Works | ✅ Works |
+| Unknown domain (Finance, Medical) | ❌ No rules to apply | ✅ Generalises via z-score signals |
 | Ambiguous cells (numeric string vs type mismatch) | ❌ Brittle regex | ✅ Learns from reward signal |
 | Changing outlier distributions over time | ❌ Hardcoded thresholds go stale | ✅ Can be retrained |
-| Multi-step context ("this column is mostly clean so this looks like an outlier") | ❌ Single-row heuristics | ✅ Sequential reasoning |
+| Any uploaded CSV with unknown columns | ❌ Breaks immediately | ✅ IQR + z-score generalise |
 
-The **CSV Upload** feature in this project demonstrates real-world generalisation: drop in any CSV with any column names and the agent adapts without any schema knowledge.
-
-> **Score note:** Agent scores are reported in the open interval `(0, 1)` — a score of `0.99` means 99% of issues were resolved. A perfect rule-based score of `1.0` would be trivial to hardcode; the RL framing makes partial credit and generalisation meaningful.
+The `/evaluate_upload` endpoint demonstrates this directly: drop in any CSV from any domain and the trained Q-policy evaluates it — no schema knowledge required.
 
 ---
 
 ## Action Space
 
-The agent chooses one discrete action per step:
-
-| Action ID | Label | Description |
-|:---------:|-------|-------------|
-| `0` | `skip` | Do nothing; move to the next problematic row |
-| `1` | `impute_missing` | Fill a `NaN` / `None` cell with the column **mean** (numeric) or **mode** (categorical) |
-| `3` | `fix_outlier` | Replace an outlier, invalid, or corrupt value with the column **mean** |
-
-> **Correct action rule**: action `1` is correct for `missing` issues; action `3` is correct for all other issue types (outlier, invalid rating, invalid negative, duplicate, type mismatch, whitespace padding).
-
-> **Note:** Action `2` is intentionally absent — reserved for a future `flag_for_review` action.
+| Action ID | Label | Description | Reward |
+|:---------:|-------|-------------|--------|
+| `0` | `skip` | Row is clean, move on | 0 |
+| `1` | `impute_missing` | Fill NaN with column mean (numeric) or mode (categorical) | +2 if correct |
+| `2` | `flag_for_review` | Mark ambiguous row without fixing | -0.5 always |
+| `3` | `fix_outlier` | Replace bad value with column mean; strip whitespace; drop duplicates | +2 if correct |
 
 ---
 
 ## Observation Space
 
-Each observation is a single row from the dirty 10-column employee DataFrame:
+Each observation exposes raw row values and column statistics — **never** the issue type label:
 
 ```json
 {
   "row_data": {
-    "age":               25,
-    "salary":            85000,
-    "city":              "Chicago",
-    "experience":        5,
-    "rating":            4.2,
-    "department":        "Engineering",
-    "bonus":             8000,
-    "years_at_company":  3,
-    "performance_score": 4.5,
-    "overtime_hours":    12
-  }
+    "patient_id":    "PAT12345",
+    "age_years":     45,
+    "systolic_bp":   -80,
+    "glucose_level": null,
+    "bmi":           24.3,
+    "diagnosis":     "Hypertension"
+  },
+  "column_stats": {
+    "systolic_bp":   {"mean": 112.4, "std": 14.2},
+    "glucose_level": {"mean": 98.7,  "std": 18.1}
+  },
+  "step_progress":    0.12,
+  "issues_remaining": 25
 }
 ```
 
-| Field | Type | Valid range | Issues |
-|-------|------|-------------|--------|
-| `age` | `float \| string \| null` | 22–62 | `null` = missing; negative = invalid_negative; `"N/A"` = type_mismatch |
-| `salary` | `float` | 35k–180k | > 300,000 = outlier |
-| `city` | `string \| null` | 8 US cities | `null` = missing; `" NY "` = whitespace_padding |
-| `experience` | `float \| null` | 0–30 | `null` = missing; negative = invalid_negative |
-| `rating` | `float \| null` | 2.5–4.9 | `null` = missing; > 5 = invalid_rating |
-| `department` | `string \| null` | 6 departments | `null` = missing; `"  HR  "` = whitespace_padding |
-| `bonus` | `float \| null` | 0–25k | `null` = missing; > 80,000 = outlier |
-| `years_at_company` | `float \| string \| null` | 0–20 | `null` = missing; negative = invalid_negative; `"ten"` = type_mismatch |
-| `performance_score` | `float \| null` | 2.5–4.9 | `null` = missing; > 5 = invalid_rating |
-| `overtime_hours` | `float \| null` | 0–80 | `null` = missing; negative = invalid_negative |
+The agent must infer from `systolic_bp: -80` (negative, z-score = -13.5) that this is an `invalid_negative` requiring `fix_outlier`. The domain name "medical" is never revealed.
 
 ---
 
@@ -106,38 +97,26 @@ Each observation is a single row from the dirty 10-column employee DataFrame:
 
 | Issue | Description | Correct action |
 |-------|-------------|---------------|
-| `missing` | Cell is `NaN` / `null` | `1` (impute_missing) |
-| `outlier` | `salary > 300,000` or `bonus > 80,000` | `3` (fix_outlier) |
-| `invalid_rating` | `rating` or `performance_score > 5` | `3` (fix_outlier) |
+| `missing` | Cell is NaN / null | `1` (impute_missing) |
+| `outlier` | Value far outside column distribution (IQR-based) | `3` (fix_outlier) |
 | `invalid_negative` | Negative value in a non-negative numeric column | `3` (fix_outlier) |
+| `invalid_range` | Value violates domain-specific bounds (e.g. discount > 100%) | `3` (fix_outlier) |
 | `duplicate` | Exact copy of a previously seen row | `3` (fix_outlier — drops row) |
-| `type_mismatch` | Non-parseable string in a numeric column (e.g. `"N/A"`, `"ten"`) | `3` (fix_outlier — coerces and imputes) |
+| `type_mismatch` | Non-parseable string in a numeric column (e.g. `"N/A"`, `"unknown"`) | `3` (fix_outlier) |
 | `whitespace_padding` | Leading/trailing spaces in a string column | `3` (fix_outlier — strips) |
-
-### Dirty → Clean Examples
-
-| Issue Type | Dirty value | Cleaned value | How |
-|---|---|---|---|
-| `missing` | `age: null` | `age: 34.5` | Column mean |
-| `outlier` | `salary: 1,500,000` | `salary: 87,423` | Column mean |
-| `invalid_rating` | `performance_score: 7.4` | `performance_score: 3.6` | Column mean |
-| `invalid_negative` | `overtime_hours: -18` | `overtime_hours: 24.1` | Column mean |
-| `duplicate` | identical copy of row 1 | row dropped | Drop |
-| `type_mismatch` | `age: "N/A"` | `age: 34.5` | Coerce → column mean |
-| `whitespace_padding` | `city: " NY "` | `city: "NY"` | Strip |
 
 ---
 
 ## Task Descriptions
 
-### Easy (20 rows, 8 issues)
-8 missing values spread across 8 different columns: age, city, experience, rating, department, bonus, years_at_company, performance_score. Every correct action is `1` (impute_missing). Seed: 42.
+### Easy (40 rows, 12 issues) — HR domain
+Single domain. Missing values, salary/bonus outliers, invalid negatives across HR employee records. The agent learns the core skip/impute/fix distinction on a familiar schema. Seed: 123.
 
-### Medium (30 rows, 12 issues)
-5 missing values + 3 salary/bonus outliers + 2 invalid rating scores (> 5) + 1 invalid negative (overtime_hours) + 1 whitespace-padded city. The agent must distinguish imputation (action `1`) from outlier correction (action `3`). Seed: 123.
+### Medium (80 rows, 20 issues) — HR + Finance domains
+Two domains. The agent encounters financial transaction records (amount, balance, credit_limit, transaction_fee) for the first time — different column names, different value distributions. Adds type_mismatch and whitespace_padding. Seed: 999.
 
-### Hard (50 rows, 20 issues)
-All 7 issue types across 10 columns: 6 missing, 4 outliers (salary/bonus), 2 invalid negatives, 2 duplicate rows, 2 type mismatches (`age="N/A"`, `years_at_company="ten"`), 2 whitespace-padded strings, 2 invalid rating scores. Seed: 999.
+### Hard (120 rows, 30 issues) — All 4 domains
+All four domains. Medical patient records and ecommerce orders join HR and Finance. All 7 issue types present. The agent cannot rely on column names — it must generalise purely from z-score signals and null/string flags. Seed: 1337.
 
 ---
 
@@ -147,43 +126,41 @@ All 7 issue types across 10 columns: 6 missing, 4 outliers (salary/bonus), 2 inv
 |-------|-------:|
 | Correct fix | `+2` |
 | Wrong action | `−1` |
+| Flag for review | `−0.5` |
 | All issues fixed (completion bonus) | `+5` |
-| Episode timeout (`max_steps = 100`) | `−5` |
+| Episode timeout | `−5` |
 
 **Score** (0.0–1.0): `fixed_issues / total_issues_at_start`
 
 ### Reward Design Rationale
 
-The reward structure is designed to produce **dense, meaningful learning signals at every step** — not just terminal rewards.
-
-- **+2 per correct fix**: Immediate per-step feedback so the agent learns which actions are right without waiting until episode end. This avoids the sparse-reward problem.
-- **−1 for wrong action**: Small enough not to be catastrophic, large enough to discourage random guessing. The +2/−1 asymmetry rewards correct decisions more than it punishes mistakes, which encourages exploration.
-- **+5 completion bonus**: Rewards thoroughness — an agent that fixes 19/20 issues scores meaningfully lower than one that fixes all 20. Creates a clear gradient toward complete cleaning.
-- **−5 timeout penalty**: Prevents a degenerate policy of cycling through rows indefinitely without committing to fixes.
-- **Partial-credit score**: Reported separately from reward as `fixed/total` — a normalised metric comparable across episodes with different issue counts, suitable for automated grading.
+- **+2 per correct fix**: Dense per-step signal — the agent gets immediate feedback without waiting for episode end. Avoids the sparse-reward problem.
+- **−1 for wrong action**: Small enough not to be catastrophic, large enough to discourage guessing. The +2/−1 asymmetry rewards correct decisions more than it punishes mistakes.
+- **−0.5 for flag_for_review**: Lighter than wrong_action — the agent is rewarded for flagging genuinely ambiguous rows rather than guessing wrong, but is incentivised to fix what it can identify.
+- **+5 completion bonus**: Rewards thoroughness — fixing 29/30 scores meaningfully lower than 30/30.
+- **−5 timeout penalty**: Prevents cycling through rows without committing to fixes.
 
 ---
 
-## Baseline Scores
+## Trained Q-Policy
 
-Rule-based `baseline_agent` (deterministic, reproducible):
+The environment ships with a trained Q-learning policy (`policy.pkl`) that is loaded automatically by `inference.py`.
 
-| Task | Score | Total Reward | Steps | Fixed |
-|------|------:|-------------:|------:|-------|
-| easy | 1.000 | 21 | 8 | 8/8 |
-| medium | 1.000 | 29 | 12 | 12/12 |
-| hard | 1.000 | 45 | 20 | 20/20 |
+**Training:** 10,500 episodes across all three difficulty levels (4,500 easy + 3,000 medium + 3,000 hard). Each level gets an independent ε decay from 1.0 → 0.05. The Q-table is shared across levels so knowledge from easy carries into hard.
+
+**Policy design:** State keys are built from `(column_name, is_null, is_str_in_numeric, has_whitespace, z_score_bucket)` per column — **not** from column names alone. This makes the policy domain-agnostic: the same z-score spike feature triggers `fix_outlier` whether the column is `salary`, `glucose_level`, or `amount`.
+
+**Evaluation scores:**
+
+| Task | Avg Score | Steps |
+|------|----------:|------:|
+| easy | 0.9900 | 12 |
+| medium | 0.9900 | 20 |
+| hard | 0.9655 | 30 |
 
 ---
 
 ## Setup & Installation
-
-### Prerequisites
-- Python 3.10+
-- Docker (for containerised deployment)
-- `openenv` CLI — `pip install openenv` (optional, for validation)
-
-### Install Python dependencies
 
 ```bash
 pip install -r requirements.txt
@@ -193,205 +170,76 @@ pip install -r requirements.txt
 
 ## Running Locally
 
-### Start the FastAPI server
-
 ```bash
+# Start FastAPI server
 uvicorn app:app --host 0.0.0.0 --port 8000 --reload
-```
 
-The server starts at `http://localhost:8000`. Interactive docs at `http://localhost:8000/docs`.
-
-### Verify endpoints
-
-```bash
 # Health check
 curl http://localhost:8000/health
 
-# Start a new episode (easy level)
+# Start hard episode (all 4 domains)
 curl -X POST http://localhost:8000/reset \
      -H "Content-Type: application/json" \
-     -d '{"task_level": "easy"}'
+     -d '{"task_level": "hard"}'
 
-# Take an action (impute_missing)
+# Take an action
 curl -X POST http://localhost:8000/step \
      -H "Content-Type: application/json" \
-     -d '{"action": 1}'
+     -d '{"action": 3}'
 
-# Get full episode state
+# Get state
 curl http://localhost:8000/state
 ```
 
-### Launch the Gradio demo UI (optional)
-
 ```bash
-python gradio_ui.py
+# Launch Gradio UI (optional)
+python gradio_ui.py  # → http://localhost:7860
 ```
-
-The demo opens at `http://localhost:7860` and lets you run episodes visually, compare before/after cleaning, and upload your own CSV.
 
 ---
 
-## Using the Python Client
+## Training the Agent
 
-### Synchronous (recommended for scripts)
-
-```python
-from client import DataCleaningClient
-
-with DataCleaningClient("http://localhost:8000").sync() as client:
-    obs = client.reset(task_level="medium")
-    print("First observation:", obs.row_data)
-
-    done = False
-    while not done:
-        result = client.step(action=1)
-        done = result.reward.done
-
-    state = client.state()
-    print(f"Score: {state.score}, Steps: {state.current_step}")
-```
-
-### Asynchronous
-
-```python
-import asyncio
-from client import DataCleaningClient
-
-async def main():
-    async with DataCleaningClient("http://localhost:8000") as client:
-        obs = await client.reset(task_level="hard")
-        result = await client.step(action=3)
-        state  = await client.state()
-        print(f"Score: {state.score}")
-
-asyncio.run(main())
+```bash
+python train.py --episodes 3000
+# Trains on easy/medium/hard across all 4 domains
+# Saves policy.pkl (~11 KB)
 ```
 
 ---
 
 ## Running Inference
 
-### Baseline agent (no API key needed)
-
 ```bash
+# Q-policy agent (loaded from policy.pkl automatically)
 python inference.py
-# or explicitly:
-python inference.py --agent baseline
-```
 
-### LLM agent
-
-```bash
+# LLM agent
 export API_BASE_URL="https://api-inference.huggingface.co/v1"
 export MODEL_NAME="meta-llama/Llama-3.2-3B-Instruct"
 export HF_TOKEN="hf_your_token_here"
-
-python inference.py --agent llm
+python inference.py
 ```
 
-### Both agents — side-by-side comparison
+---
+
+## Live Space
 
 ```bash
-python inference.py --agent both
-```
+curl https://Ridi2007-rl-data-cleaning-env.hf.space/health
 
-### Verbose mode — step-by-step decision trace
-
-```bash
-python inference.py --verbose
-# Shows each step: column · issue type · action taken · correct? · reward
-```
-
-### Single task level
-
-```bash
-python inference.py --task hard
-```
-
-If the LLM call fails (bad key, network error), the agent automatically falls back to `baseline_agent` — the script never crashes.
-
-### Live Space — quick test
-
-```bash
 curl -X POST https://Ridi2007-rl-data-cleaning-env.hf.space/reset \
      -H "Content-Type: application/json" \
-     -d '{"task_level": "medium"}'
-
-curl https://Ridi2007-rl-data-cleaning-env.hf.space/health
+     -d '{"task_level": "hard"}'
 ```
 
 ---
 
 ## Docker
 
-### Build the image
-
 ```bash
 docker build -t rl-data-cleaning-env .
-```
-
-### Run the container
-
-```bash
 docker run -p 8000:8000 rl-data-cleaning-env
-```
-
-### Test the running container
-
-```bash
-curl -X POST http://localhost:8000/reset \
-     -H "Content-Type: application/json" \
-     -d '{"task_level": "medium"}'
-```
-
----
-
-## Deploying to Hugging Face Spaces
-
-1. **Create a new Space** at [huggingface.co/spaces](https://huggingface.co/spaces):
-   - Runtime: **Docker**
-   - Visibility: **Public**
-
-2. **Ensure the README front matter** is present (already included at the top of this file):
-   ```yaml
-   ---
-   sdk: docker
-   app_port: 8000
-   ---
-   ```
-   This tells Hugging Face to route traffic to port 8000. Without `app_port: 8000` the automated ping will get a connection refused.
-
-3. **Push this repository** to the Space:
-   ```bash
-   git remote add space https://huggingface.co/spaces/<your-username>/<space-name>
-   git push space main
-   ```
-
-4. **Confirm the endpoint is live**:
-   ```bash
-   curl -X POST https://<your-username>-<space-name>.hf.space/reset \
-        -H "Content-Type: application/json" \
-        -d '{"task_level": "easy"}'
-   ```
-   Expect HTTP 200 and a JSON body with `"observation"`.
-
----
-
-## OpenEnv Validation
-
-```bash
-openenv validate
-```
-
----
-
-## Pre-submission Validation Script
-
-```bash
-chmod +x validate-submission.sh
-
-# Run all checks (Space must be deployed first):
-./validate-submission.sh https://<your-space>.hf.space .
 ```
 
 ---
@@ -399,32 +247,29 @@ chmod +x validate-submission.sh
 ## Project Structure
 
 ```
-hackathon/
-├── app.py                  # FastAPI OpenEnv server
-├── client.py               # Typed HTTP client
-├── models.py               # Pydantic models
-├── env.py                  # DataCleaningEnv — environment logic
-├── agent.py                # Baseline & upload agents
-├── inference.py            # Baseline & LLM inference runners
-├── gradio_ui.py            # Optional Gradio demo UI
-├── openenv.yaml            # OpenEnv specification file
-├── Dockerfile              # Container definition (serves FastAPI on port 8000)
-├── requirements.txt        # Python dependencies
-├── README.md               # This file
-└── validate-submission.sh  # Pre-submission validator
+├── app.py          # FastAPI OpenEnv server
+├── env.py          # Multi-domain DataCleaningEnv (HR/Finance/Medical/Ecommerce)
+├── agent.py        # Domain-agnostic baseline agent (z-score + null signals)
+├── train.py        # Q-learning trainer — saves policy.pkl
+├── inference.py    # Q-policy → LLM → baseline agent runner
+├── models.py       # Pydantic v2 typed models
+├── client.py       # Typed HTTP client (sync + async)
+├── gradio_ui.py    # Gradio demo UI
+├── openenv.yaml    # OpenEnv specification
+├── policy.pkl      # Trained Q-policy (10500 episodes)
+├── Dockerfile      # FastAPI on 8000, Gradio on 7860
+└── start.sh        # Production entrypoint
 ```
 
 ---
 
-## Environment Variables Reference
+## Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `API_BASE_URL` | LLM API base URL | `https://api-inference.huggingface.co/v1` |
 | `MODEL_NAME` | LLM model identifier | `meta-llama/Llama-3.2-3B-Instruct` |
-| `HF_TOKEN` | Hugging Face API token (used as API key) | — |
-| `OPENAI_API_KEY` | Alias for `HF_TOKEN` | — |
-| `AGENT_TYPE` | `"baseline"` or `"llm"` | `"baseline"` |
+| `HF_TOKEN` | Hugging Face API token | — |
 
 ---
 
