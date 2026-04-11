@@ -171,11 +171,11 @@ class StepResultModel(BaseModel):
 _VALID_ISSUE_TYPES = {
     "missing",
     "outlier",
-    "invalid_rating",
     "invalid_negative",
-    "duplicate",          # FIX: added — exact duplicate row
-    "type_mismatch",      # FIX: added — string value in expected-numeric column
-    "whitespace_padding", # FIX: added — leading/trailing whitespace in string column
+    "invalid_range",      # value violates domain-specific valid range
+    "duplicate",          # exact duplicate row
+    "type_mismatch",      # non-parseable string in numeric column
+    "whitespace_padding", # leading/trailing whitespace in string column
 }
 
 
