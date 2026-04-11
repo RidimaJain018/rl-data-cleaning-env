@@ -1,30 +1,33 @@
 """
 train.py — Q-Learning agent trainer for DataCleaningEnv
 =========================================================
-Trains a tabular Q-learning policy on all three difficulty levels
-(easy / medium / hard) and saves the learned policy to policy.pkl.
+[OPTION A] Trains on all three difficulty levels across four real-world domains.
 
-The trained policy is loaded by inference.py at evaluation time.
+Domains per level:
+    easy   → HR employee records only
+    medium → HR + Finance transactions
+    hard   → HR + Finance + Medical + Ecommerce (all four domains)
 
-Observation features (what the agent actually sees — NO issue labels):
-    For each column in the row:
-        • is_null      — cell is NaN / None
-        • is_string_in_numeric_col — non-parseable string in a numeric column
-        • has_whitespace — string with leading/trailing spaces
-        • numeric_value — z-score of the numeric value (0 if non-numeric)
+The Q-policy is domain-agnostic: it learns from (null-flags, z-score buckets,
+whitespace signals) which are meaningful regardless of column names or domain.
 
-The key design choice: the observation NEVER reveals the issue type.
-The agent must learn to map raw cell signals → correct action.
+The agent practices very_hard rows (near-boundary salaries, all 7 issue
+types at scale) during training, so the Q-policy covers those state keys
+directly rather than falling back to the rule-based agent.
 
-Training loop:
-    - 3,000 episodes per difficulty level (9,000 total)
-    - Epsilon-greedy exploration: ε decays from 1.0 → 0.05
-    - Learning rate α = 0.1, discount γ = 0.95
-    - Policy is saved as {state_key: best_action} dict
+Q-table is shared across levels — knowledge from easy carries forward into
+very_hard, so the agent builds on what it already learned.
+
+Episode schedule per level:
+    easy      → 1.5× base  (single domain, foundation for z-score learning)
+    medium    → 1.0× base  (two domains, agent sees Finance schema for first time)
+    hard      → 1.0× base  (all four domains, agent must generalise across schemas)
+
+Each level gets its own independent 1.0 → 0.05 epsilon decay.
 
 Usage:
-    python train.py                  # train and save policy.pkl
-    python train.py --episodes 5000  # custom episode count per level
+    python train.py                  # 3000 base → 13500 total episodes
+    python train.py --episodes 5000  # custom base count
 """
 
 from __future__ import annotations
@@ -241,15 +244,16 @@ def train(episodes_per_level: int = 3000) -> None:
     # Each level gets its own full epsilon decay so easy isn't stuck at high noise.
     # Easy gets 1.5x episodes — it's the foundation the other levels build on.
     eps_per_task = {
-        "easy":   max(episodes_per_level, int(episodes_per_level * 1.5)),
-        "medium": episodes_per_level,
-        "hard":   episodes_per_level,
+        "easy":      max(episodes_per_level, int(episodes_per_level * 1.5)),
+        "medium":    episodes_per_level,
+        "hard":      episodes_per_level,
+
     }
     total_eps = sum(eps_per_task.values())
 
     print("=" * 60)
-    print("DataCleaningEnv — Q-Learning Training")
-    print(f"Episodes easy/medium/hard  : "
+    print("DataCleaningEnv — Q-Learning Training  [Option A: all 3 levels, full training]")
+    print(f"Episodes easy/medium/hard : "
           f"{eps_per_task['easy']}/{eps_per_task['medium']}/{eps_per_task['hard']}")
     print(f"Total episodes     : {total_eps}")
     print(f"Actions            : {ACTIONS}")
@@ -259,7 +263,7 @@ def train(episodes_per_level: int = 3000) -> None:
 
     rng     = np.random.default_rng(0)
     env     = DataCleaningEnv()
-    q_table: Dict[Tuple, Dict[int, float]] = defaultdict(lambda: {a: 0.0 for a in ACTIONS})
+    q_table: Dict[Tuple, Dict[int, float]] = defaultdict(lambda: {a: 0.0 for a in ACTIONS})  # includes action 2
 
     for task in TASK_LEVELS:
         n_eps = eps_per_task[task]
