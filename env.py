@@ -364,37 +364,40 @@ class DataCleaningEnv:
         self.means: dict           = {}
         self.modes: dict           = {}
         self.total_issues_at_start = 0
+        self._episode_count: int   = 0   # tracks calls to reset() for seed rotation
 
     # -----------------------------------------------------------------------
     # BUILT-IN TASK DATA — multi-domain procedural generation
     # -----------------------------------------------------------------------
-    def load_task_data(self, task_level: str) -> tuple[list[dict], str]:
+    def load_task_data(self, task_level: str, episode_offset: int = 0) -> tuple[list[dict], str]:
         """
         Generate a dirty multi-domain dataset for the given difficulty level.
 
-        Returns (rows, domain_name) — domain is randomly sampled from the
-        level's active domain pool each episode for variety.
+        The seed rotates with each episode_offset so consecutive reset() calls
+        produce different domains and issue placements — giving natural score
+        variance across runs while remaining fully reproducible per offset value.
+
+        Returns (rows, domain_name, issues).
         """
         if task_level not in _SEEDS:
             raise ValueError(
                 f"Unknown task_level {task_level!r}. Use 'easy', 'medium', or 'hard'."
             )
 
-        seed = _SEEDS[task_level]
+        # Rotating seed: base + episode offset (mod large prime keeps it varied)
+        seed = _SEEDS[task_level] + (episode_offset * 31) % 9973
         rng  = np.random.default_rng(seed)
 
         active_domains = _LEVEL_DOMAINS[task_level]
         issue_types    = _LEVEL_ISSUES[task_level]
         n_rows, n_issues = _LEVEL_SIZE[task_level]
 
-        # Pick one domain per episode (rotate via seed so it's reproducible)
+        # Domain rotates each episode — on hard all 4 domains appear across runs
         domain = active_domains[int(rng.integers(0, len(active_domains)))]
         gen    = _DOMAIN_GENERATORS[domain]
 
-        # Generate clean rows
-        rows = [gen(rng) for _ in range(n_rows)]
-
-        # Inject issues — ground truth returned separately
+        # Generate clean rows then inject issues
+        rows   = [gen(rng) for _ in range(n_rows)]
         issues = _inject_issues(rows, domain, issue_types, n_issues, rng)
 
         return rows, domain, issues
@@ -412,7 +415,8 @@ class DataCleaningEnv:
         self._is_custom  = False
         self.episode_log = []
 
-        rows, domain, issues = self.load_task_data(task_level)
+        self._episode_count += 1
+        rows, domain, issues = self.load_task_data(task_level, self._episode_count)
         self._active_domain  = domain
 
         self.df          = pd.DataFrame(rows)
@@ -714,6 +718,7 @@ class DataCleaningEnv:
         return {
             "task_level":            self._task_level,
             "domain":                self._active_domain,
+            "episode":               self._episode_count,
             "current_step":          self.steps,
             "max_steps":             self.max_steps,
             "total_issues_at_start": total,

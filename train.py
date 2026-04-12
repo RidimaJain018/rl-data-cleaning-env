@@ -11,8 +11,12 @@ Domains per level:
 The Q-policy is domain-agnostic: it learns from (null-flags, z-score buckets,
 whitespace signals) which are meaningful regardless of column names or domain.
 
+The agent practices very_hard rows (near-boundary salaries, all 7 issue
+types at scale) during training, so the Q-policy covers those state keys
+directly rather than falling back to the rule-based agent.
+
 Q-table is shared across levels — knowledge from easy carries forward into
-hard, so the agent builds on what it already learned.
+very_hard, so the agent builds on what it already learned.
 
 Episode schedule per level:
     easy      → 1.5× base  (single domain, foundation for z-score learning)
@@ -20,6 +24,8 @@ Episode schedule per level:
     hard      → 1.0× base  (all four domains, agent must generalise across schemas)
 
 Each level gets its own independent 1.0 → 0.05 epsilon decay.
+The rotating seed means each episode trains on a different domain — on hard,
+the agent sees HR, Finance, Medical, and Ecommerce rows all within one training run.
 
 Usage:
     python train.py                  # 3000 base → 13500 total episodes
@@ -184,6 +190,8 @@ def _train_episode(
     epsilon: float,
     rng:     np.random.Generator,
 ) -> float:
+    # env._episode_count increments on each reset() call,
+    # so the rotating seed automatically varies domain each episode
     obs      = env.reset(task_level=task)
     state    = _obs_to_state_key(obs)
     total_r  = 0.0
