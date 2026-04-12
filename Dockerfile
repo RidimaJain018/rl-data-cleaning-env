@@ -31,9 +31,15 @@ COPY app.py        .
 COPY inference.py  .
 COPY gradio_ui.py  .
 COPY openenv.yaml  .
+COPY train.py      .
 COPY start.sh      .
 
 RUN chmod +x start.sh
+
+# Train the Q-learning policy at build time so policy.pkl is baked into
+# the image — no binary file needed in git. 500 episodes per level keeps
+# build time under 3 minutes while producing a working policy.
+RUN python train.py --episodes 500
 
 ENV API_BASE_URL="" \
     MODEL_NAME="meta-llama/Llama-3.2-3B-Instruct" \
