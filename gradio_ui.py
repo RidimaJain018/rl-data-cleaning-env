@@ -84,29 +84,26 @@ def _llm_factory(api_key: str, base_url: str, model: str):
                 model=model.strip() or "meta-llama/Llama-3.2-3B-Instruct",
                 messages=[
                     {"role": "system", "content":
-                     "You are an expert data quality analyst reviewing rows from an employee dataset.\n\n"
-                     "DATASET SCHEMA AND VALID RANGES:\n"
-                     "  age              : integer, valid range 22-62\n"
-                     "  salary           : integer USD, valid range 35000-180000\n"
-                     "  city             : string, one of [NY, LA, SF, Chicago, Austin, Seattle, Boston, Denver]\n"
-                     "  experience       : integer years, valid range 0-30\n"
-                     "  rating           : float, valid range 0.0-5.0\n"
-                     "  department       : string, one of [Engineering, Sales, HR, Marketing, Finance, Operations]\n"
-                     "  bonus            : integer USD, valid range 0-25000\n"
-                     "  years_at_company : integer years, valid range 0-20\n"
-                     "  performance_score: float, valid range 0.0-5.0\n"
-                     "  overtime_hours   : integer, valid range 0-80\n\n"
+                     "You are an expert data quality analyst. "
+                     "You review rows from multi-domain datasets (HR, Finance, Medical, Ecommerce).\n\n"
+                     "DOMAIN RANGES:\n"
+                     "  HR     : age 22-62 | salary 35k-180k | experience 0-30 | bonus 0-25k | overtime 0-80 | rating/perf 0-5\n"
+                     "  Finance: amount 0-10k | balance 0-100k | credit_limit 500-50k | fee 0-100\n"
+                     "  Medical: age_years 0-120 | systolic_bp 70-200 | diastolic_bp 40-130 | heart_rate 30-200\n"
+                     "           glucose 40-500 | bmi 10-70 | dosage_mg 0.1-2000 | lab_value 0-100\n"
+                     "  Ecomm  : price 0-10k | quantity 0-10k | discount_pct 0-100 | shipping_days 0-60\n"
+                     "           review_score 1-5 | return_rate 0-1\n\n"
                      "ACTIONS:\n"
-                     "  0 = skip           — row has no data quality issue\n"
-                     "  1 = impute_missing — row has a NULL / missing cell\n"
-                     "  3 = fix_outlier    — row has any other issue (outlier, invalid value,\n"
-                     "                       type mismatch, whitespace padding, negative)\n\n"
-                     "Carefully examine each field against the valid ranges. "
+                     "  0 = skip           — row is clean\n"
+                     "  1 = impute_missing — a cell is NULL / missing\n"
+                     "  3 = fix_outlier    — value out of range, negative where impossible,\n"
+                     "                       non-parseable string in numeric column, whitespace padding\n\n"
+                     "Infer the domain from column names. "
                      'Reply ONLY with JSON: {"action": <0|1|3>}'},
                     {"role": "user", "content":
-                     "Examine this employee record and identify any data quality issue:\n\n"
+                     "Examine this row and identify any data quality issue:\n\n"
                      + "\n".join(lines)
-                     + "\n\nCheck each field against the valid ranges. "
+                     + "\n\nInfer the domain from column names and check against valid ranges. "
                      'Reply ONLY with JSON: {"action": <0|1|3>}'},
                 ],
                 temperature=0, max_tokens=32,
@@ -219,7 +216,7 @@ def _issue_breakdown(env) -> str:
     issue_colors = {
         "missing":           TEAL,
         "outlier":           BEIGE,
-        "invalid_rating":    "#E8A87C",
+        "invalid_range":     "#E8A87C",
         "invalid_negative":  "#D4A5E0",
         "duplicate":         "#7EC8C8",
         "type_mismatch":     "#F0C674",
@@ -544,7 +541,7 @@ with gr.Blocks(css=css, title="RL Data Cleaning Agent") as demo:
         f"padding:4px 12px;border-radius:20px;text-transform:uppercase;'>&#127942; OpenEnv Hackathon</span>"
         f"<span style='background:{SURFACE2};border:1px solid {BEIGE}33;color:{BEIGE};"
         f"font-size:0.58rem;font-family:DM Mono,monospace;letter-spacing:0.1em;"
-        f"padding:4px 12px;border-radius:20px;text-transform:uppercase;'>v1.2 · 10 columns</span>"
+        f"padding:4px 12px;border-radius:20px;text-transform:uppercase;'>v2.0 · 4 domains</span>"
         f"</div></div>"
         f"<div style='display:grid;grid-template-columns:repeat(3,1fr);gap:10px;'>"
         f"<div style='background:{SURFACE2};border:1px solid {BORDER};border-radius:10px;padding:12px 16px;'>"
@@ -554,8 +551,8 @@ with gr.Blocks(css=css, title="RL Data Cleaning Agent") as demo:
         f"</div>"
         f"<div style='background:{SURFACE2};border:1px solid {BORDER};border-radius:10px;padding:12px 16px;'>"
         f"<div style='font-size:0.55rem;font-family:DM Mono,monospace;letter-spacing:0.14em;text-transform:uppercase;color:{TEAL};margin-bottom:4px;'>Actions</div>"
-        f"<div style='font-size:0.8rem;color:{TEXT};font-weight:600;'>skip &nbsp;&middot;&nbsp; impute &nbsp;&middot;&nbsp; fix_outlier</div>"
-        f"<div style='font-size:0.62rem;color:{SUBTEXT};margin-top:3px;font-family:DM Mono,monospace;'>7 issue types across 10 columns</div>"
+        f"<div style='font-size:0.8rem;color:{TEXT};font-weight:600;'>skip &nbsp;&middot;&nbsp; impute &nbsp;&middot;&nbsp; flag &nbsp;&middot;&nbsp; fix</div>"
+        f"<div style='font-size:0.62rem;color:{SUBTEXT};margin-top:3px;font-family:DM Mono,monospace;'>HR · Finance · Medical · Ecommerce</div>"
         f"</div>"
         f"<div style='background:{SURFACE2};border:1px solid {BORDER};border-radius:10px;padding:12px 16px;'>"
         f"<div style='font-size:0.55rem;font-family:DM Mono,monospace;letter-spacing:0.14em;text-transform:uppercase;color:{TEAL};margin-bottom:4px;'>Reward</div>"

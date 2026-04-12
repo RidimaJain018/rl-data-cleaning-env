@@ -187,15 +187,23 @@ def _q_policy_agent(obs) -> Optional[int]:
 # ---------------------------------------------------------------------------
 # Agent 2 — LLM agent (OpenAI-compatible, proxied through checker)
 # ---------------------------------------------------------------------------
+# Valid ranges across all four domains (HR / Finance / Medical / Ecommerce)
 EXPECTED_NUMERIC_RANGES = {
-    "age": (22, 62),
-    "salary": (35000, 180000),
-    "experience": (0, 30),
-    "rating": (0.0, 5.0),
-    "bonus": (0, 25000),
-    "years_at_company": (0, 20),
-    "performance_score": (0.0, 5.0),
-    "overtime_hours": (0, 80),
+    # HR
+    "age": (22, 62), "salary": (35000, 180000), "experience": (0, 30),
+    "rating": (0.0, 5.0), "bonus": (0, 25000), "years_at_company": (0, 20),
+    "performance_score": (0.0, 5.0), "overtime_hours": (0, 80),
+    # Finance
+    "amount": (0.01, 10000), "balance": (0, 100000),
+    "credit_limit": (500, 50000), "transaction_fee": (0, 100),
+    # Medical
+    "age_years": (0, 120), "systolic_bp": (70, 200), "diastolic_bp": (40, 130),
+    "heart_rate": (30, 200), "glucose_level": (40, 500),
+    "bmi": (10, 70), "dosage_mg": (0.1, 2000), "lab_value": (0, 100),
+    # Ecommerce
+    "price": (0.01, 10000), "quantity": (0, 10000), "discount_pct": (0, 100),
+    "shipping_days": (0, 60), "review_score": (1.0, 5.0),
+    "return_rate": (0.0, 1.0), "units_sold": (0, 1000000),
 }
 
 
@@ -219,22 +227,45 @@ def _llm_agent(obs) -> int:
             else:
                 row_lines.append(f"  {col}: {val}")
 
+        # Build domain context from column_stats keys — tells LLM which domain this is
+        col_names = list(row_data.keys())
+        if any(c in col_names for c in ["systolic_bp", "glucose_level", "bmi", "dosage_mg"]):
+            domain_hint = "MEDICAL patient record (vitals, lab values, diagnoses)"
+            ranges_hint = ("  age_years: 0-120 | systolic_bp: 70-200 | diastolic_bp: 40-130\n"
+                          "  heart_rate: 30-200 | glucose_level: 40-500 | bmi: 10-70\n"
+                          "  dosage_mg: 0.1-2000 | lab_value: 0-100")
+        elif any(c in col_names for c in ["amount", "balance", "credit_limit", "transaction_fee"]):
+            domain_hint = "FINANCE transaction record (amounts, accounts, merchants)"
+            ranges_hint = ("  amount: 0.01-10000 | balance: 0-100000\n"
+                          "  credit_limit: 500-50000 | transaction_fee: 0-100")
+        elif any(c in col_names for c in ["price", "quantity", "discount_pct", "review_score"]):
+            domain_hint = "ECOMMERCE order record (prices, quantities, ratings, shipping)"
+            ranges_hint = ("  price: 0.01-10000 | quantity: 0-10000 | discount_pct: 0-100\n"
+                          "  shipping_days: 0-60 | review_score: 1.0-5.0 | return_rate: 0-1.0")
+        else:
+            domain_hint = "HR employee record (salary, performance, tenure)"
+            ranges_hint = ("  age: 22-62 | salary: 35000-180000 | experience: 0-30\n"
+                          "  rating: 0-5 | bonus: 0-25000 | years_at_company: 0-20\n"
+                          "  performance_score: 0-5 | overtime_hours: 0-80")
+
         system_prompt = (
-            "You are an expert data quality analyst reviewing rows from an employee dataset.\n\n"
-            "DATASET SCHEMA AND VALID RANGES:\n"
-            "  age: integer 22-62 | salary: integer 35000-180000 | city: string\n"
-            "  experience: integer 0-30 | rating: float 0-5 | department: string\n"
-            "  bonus: integer 0-25000 | years_at_company: integer 0-20\n"
-            "  performance_score: float 0-5 | overtime_hours: integer 0-80\n\n"
-            "ACTIONS: 0=skip, 1=impute_missing (NULL cell), 3=fix_outlier (any other issue)\n"
+            f"You are an expert data quality analyst reviewing a {domain_hint}.\n\n"
+            "VALID RANGES FOR NUMERIC COLUMNS:\n"
+            f"{ranges_hint}\n\n"
+            "ACTIONS:\n"
+            "  0 = skip           — row is clean, no issue\n"
+            "  1 = impute_missing — a cell is NULL / missing\n"
+            "  3 = fix_outlier    — any other issue: value out of range, negative where "
+            "impossible, non-parseable string in numeric column, whitespace in string column\n\n"
+            "Examine each field against the valid ranges above.\n"
             "Respond ONLY with JSON: {\"action\": <0|1|3>, \"reason\": \"<one sentence>\"}"
         )
         response = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": "Examine:\n" + "\n".join(row_lines) +
-                 "\nRespond ONLY with JSON: {\"action\": <0|1|3>, \"reason\": \"...\"}"},
+                {"role": "user",   "content": "Examine this row and identify any data quality issue:\n\n" + "\n".join(row_lines) +
+                 "\n\nRespond ONLY with JSON: {\"action\": <0|1|3>, \"reason\": \"...\"}"},
             ],
             temperature=0,
             max_tokens=80,
